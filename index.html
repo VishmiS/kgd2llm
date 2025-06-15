@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Semantic Search</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Semantic Search</h1>
+        <div class="content-wrapper">
+            <!-- Left Section for Inputs -->
+            <div class="left-section">
+                <form id="prediction-form">
+                    <label for="sentence1">Sentence 1:</label>
+                    <input type="text" id="sentence1" name="sentence1" value="The quick brown fox jumps over the lazy dog." required>
+
+                    <label for="sentence2">Sentence 2:</label>
+                    <input type="text" id="sentence2" name="sentence2" value="A fast brown fox leaps over a lazy dog." required>
+
+                    <button type="button" id="predict-btn">Predict</button>
+                    <button type="button" id="reset-btn">Reset</button>
+
+                    <div id="error-message"></div>
+                </form>
+            </div>
+
+            <!-- Right Section for Results -->
+            <div class="right-section">
+                <div id="prediction-result" style="display: none;">
+                    <h2>
+                        Prediction Results
+                        <span class="info-icon" title="Labels: Entailment, Neutral, Contradiction">ℹ️</span>
+                    </h2>
+                    <p><strong>Natural Language Inference Label:</strong> <span id="predicted-label"></span></p>
+                    <p><strong>Confidence Score:</strong> <span id="confidence-score"></span></p>
+
+                    <div id="sentence-info-container" class="bordered-container">
+                        <p><strong>Sentence 1:</strong> <span id="sentence1-info"></span></p>
+                        <p><strong>Sentence 2:</strong> <span id="sentence2-info"></span></p>
+                    </div>
+
+                    <!-- LIME Explanation Section -->
+                    <div id="lime-explanation-sts" style="display: none; margin-top: 20px;">
+                        <h3>LIME Explanation</h3>
+                        <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                            <thead>
+                                <tr style="background-color: #f0f0f0;">
+                                    <th style="text-align: left; padding: 8px;">Word</th>
+                                    <th style="text-align: right; padding: 8px;">Weight</th>
+                                </tr>
+                            </thead>
+                            <tbody id="lime-table-body-sts"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- New Question-Answer Section -->
+        <div class="content-wrapper">
+            <div class="left-section">
+                <form id="qa-form">
+                    <label for="question">Enter your question:</label>
+                    <input type="text" id="question" name="question" value="Why are dogs so cute?" required>
+
+                    <label for="context">Enter context:</label>
+                    <input type="text" id="context" name="context" value="Dogs are cuter than cats" required>
+
+                    <button type="button" id="submit-btn">Submit</button>
+                    <button type="button" id="reset-btn2">Reset</button>
+                    <div id="qa-error-message" class="error-box" style="display: none;"></div>
+                </form>
+            </div>
+
+            <div class="right-section">
+                <div id="qa-result" style="display: none;">
+                    <h2>Answer</h2>
+                    <p id="answer"></p>
+
+                    <!-- LIME Explanation Section -->
+                    <div id="lime-explanation-qa" style="display: none; margin-top: 20px;">
+                        <h3>LIME Explanation</h3>
+                        <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                            <thead>
+                                <tr style="background-color: #f0f0f0;">
+                                    <th style="text-align: left; padding: 8px;">Word</th>
+                                    <th style="text-align: right; padding: 8px;">Weight</th>
+                                </tr>
+                            </thead>
+                            <tbody id="lime-table-body-qa"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

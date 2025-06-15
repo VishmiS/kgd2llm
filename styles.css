@@ -1,0 +1,172 @@
+body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+    background-color: #f0f8f1;  /* Light greenish background */
+}
+
+.container {
+    width: 60%;
+    margin: auto;
+    padding: 50px;
+    background: white;
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+h1 {
+    text-align: center;
+    color: #000000;  /* Dark green */
+}
+
+.content-wrapper {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 20px;
+}
+
+.left-section, .right-section {
+    width: 45%;
+    padding: 20px;
+    background: #e8f5e9;  /* Light greenish background for sections */
+    border-radius: 10px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+label {
+    display: block;
+    margin: 10px 0 5px;
+    color: #000000;  /* Dark green for labels */
+}
+
+input[type="text"], button {
+    width: 100%;
+    padding: 10px;
+    margin-bottom: 10px;
+    border: 1px solid #81c784;  /* Light green border */
+    border-radius: 5px;
+}
+
+button {
+    background: #4caf50;  /* Green background for button */
+    color: white;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+button:hover {
+    background: #388e3c;  /* Darker green on hover */
+}
+
+#error-message {
+    color: red;
+    font-size: 0.9em;
+    display: none;
+}
+
+#prediction-result {
+    background: #e8f5e9;  /* Greenish background for the result box */
+    padding: 10px;
+    border-radius: 5px;
+    color: #050505;  /* Dark green text for the result */
+    font-size: 0.8em;
+}
+
+#prediction-result p {
+    font-size: 1em;  /* Regular size for prediction details */
+}
+
+#sentence-info-container p {
+    font-size: 0.9em;  /* Smaller text for sentence details */
+    font-weight: normal;  /* Remove bold font */
+    color: rgba(0, 0, 0, 0.7);  /* Slightly lighter color for sentence text */
+}
+
+/* Style for the bordered container */
+.bordered-container {
+    border: 1px solid #ccc; /* Light gray border */
+    border-radius: 5px; /* Rounded corners */
+    padding: 10px; /* Padding inside the container */
+    margin-top: 10px; /* Space above the container */
+    background-color: #f9f9f9; /* Light background color */
+}
+
+/* Style for the text inside the container */
+.bordered-container p {
+    font-size: 14px; /* Smaller text size */
+    font-weight: normal; /* Remove bold formatting */
+    margin: 5px 0; /* Space between sentences */
+}
+
+/* Optional: Style for the labels (e.g., Sentence 1:) */
+.bordered-container p span:first-child {
+    margin-right: 5px; /* Add space between the label and the text */
+}
+
+/* Info icon style */
+.info-icon {
+    display: inline-block;
+    font-size: 0.5em;  /* Smaller size for the info icon */
+    color: rgba(0, 0, 0, 0.6); /* Black with transparency */
+    cursor: pointer;
+    position: relative; /* Required for the tooltip */
+}
+
+
+.info-icon:hover::after {
+    content: "Labels Breakdown:\a • Entailment: Sentence 2 subset of Sentence 1.\a • Neutral: Sentence 1 and Sentence 2 has the same meaning.\a • Contradiction: Sentences conflict.";
+    position: absolute;
+    top: 25px; /* Adjust for spacing above the tooltip */
+    left: 50%; /* Center it horizontally */
+    transform: translateX(-50%);
+    background-color: rgba(73, 73, 73, 0.9); /* Black with some transparency */
+    color: white;
+    font-size: 9px;
+    padding: 10px;
+    border-radius: 5px;
+    white-space: pre-wrap; /* Enable multi-line and indentation */
+    line-height: 1.5; /* Improve line spacing */
+    z-index: 1000; /* Ensure it appears on top */
+    width: 270px; /* Set a fixed width for the tooltip box */
+    text-align: left;
+    pointer-events: none; /* Prevent interaction with the tooltip */
+}
+
+.info-icon:hover::before {
+    content: '';
+    position: absolute;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    border-width: 5px;
+    border-style: solid;
+    border-color: rgba(0, 0, 0, 0.8) transparent transparent transparent;
+    z-index: 999;
+}
+
+#qa-result {
+    background: #e8f5e9;
+    padding: 10px;
+    border-radius: 5px;
+    color: #050505;
+    font-size: 1em;
+    display: none;
+}
+
+.error-box {
+    color: red;
+    margin-top: 10px;
+    font-size: 0.9em;
+    border: 1px solid red;
+    padding: 5px;
+    border-radius: 5px;
+    background-color: #ffe6e6;
+}
+
+#qa-result {
+    background: #e8f5e9;  /* Greenish background for the result box */
+    padding: 10px;
+    border-radius: 5px;
+    color: #050505;  /* Dark green text for the result */
+    font-size: 0.8em;
+}
