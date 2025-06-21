@@ -1,4 +1,4 @@
-const apiUrl = "http://127.0.0.1:5000/"; // Unified backend URL
+const apiUrl = "http://localhost:5000/"; // Unified backend URL
 
 document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("predict-btn").addEventListener("click", predictLabel);
@@ -42,11 +42,8 @@ async function predictLabel() {
         document.getElementById("confidence-score").innerText = `${result.confidence_score.toFixed(2)}%`;
 
         // Highlight keywords in sentences
-        document.getElementById("sentence1-info").innerHTML = highlightTextWithKeywords(
-            result.highlighted_keywords.sentence1,
-            result.lime_explanation.keywords,
-            result.lime_explanation.weights
-        );
+        document.getElementById("sentence1-info").innerHTML = result.highlighted_keywords.sentence1;
+        document.getElementById("sentence2-info").innerHTML = result.highlighted_keywords.sentence2;
 
         document.getElementById("sentence2-info").innerHTML = highlightTextWithKeywords(
             result.highlighted_keywords.sentence2,

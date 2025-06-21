@@ -25,7 +25,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Load model and tokenizer
-model_path = './student_model/fianl_student_model.pt'
+model_path = './student_model/final_student_model.pt'
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")  # Use BERT tokenizer
 
 # Set padding token and verify
@@ -101,7 +101,12 @@ def predict():
         class_names = ["entailment", "neutral", "contradiction"]
         explainer = LimeTextExplainer(class_names=class_names)
 
-        explanation = explainer.explain_instance(f"{sentence1} {sentence2}", predict_proba, num_features=10)
+        explanation = explainer.explain_instance(
+            f"{sentence1} {sentence2}",
+            predict_proba,
+            num_features=10,
+            num_samples=200  # or 100–300 for faster performance, removing this line will provide faster performance.
+        )
         lime_explanation = explanation.as_list()
 
         highlighted_data = highlight_keywords(sentence1, sentence2, predicted_label, lime_explanation)
@@ -142,52 +147,37 @@ def get_color_from_weight(weight):
     return color
 
 def highlight_keywords(sentence1, sentence2, predicted_label, lime_explanation):
-    words1 = sentence1.split()
-    words2 = sentence2.split()
+    """
+    Highlights keywords from LIME explanation in sentence1 and sentence2
+    using color coding based on weight.
+    """
+    # Build a dictionary of words and their weights from the explanation
+    lime_dict = {word.lower(): weight for word, weight in lime_explanation}
 
-    words1 = [word.strip(string.punctuation) for word in words1]
-    words2 = [word.strip(string.punctuation) for word in words2]
+    def highlight_text(sentence):
+        # Tokenize keeping punctuation for display
+        words = sentence.split()
+        highlighted_sentence = []
 
-    words1 = [word for word in words1 if word.lower() not in stop_words]
-    words2 = [word for word in words2 if word.lower() not in stop_words]
+        for word in words:
+            clean_word = word.strip(string.punctuation)
+            weight = lime_dict.get(clean_word.lower(), None)
 
-    importance_dict = {word: 0 for word in words1 + words2}
-
-    if isinstance(lime_explanation, list):
-        for item in lime_explanation:
-            if len(item) == 2:
-                word, weight = item
-                word_lower = word.lower()
-                if word_lower in importance_dict:
-                    importance_dict[word_lower] = weight
+            if weight is not None:
+                color = get_color_from_weight(weight)
+                marked_word = f'<mark style="background-color: {color};" data-weight="{weight}" class="highlight">{word}</mark>'
+                highlighted_sentence.append(marked_word)
             else:
-                logger.warning(f"Unexpected format in LIME explanation: {item}")
-    else:
-        logger.error(f"LIME explanation is not a list: {lime_explanation}")
+                highlighted_sentence.append(word)
 
-    keywords = list(importance_dict.keys())
-    feature_importances = list(importance_dict.values())
-
-    highlighted_sentence1 = sentence1
-    highlighted_sentence2 = sentence2
-
-    for i, keyword in enumerate(keywords):
-        importance_score = feature_importances[i]
-        color = get_color_from_weight(importance_score)
-
-        highlighted_sentence1 = re.sub(rf'\b{re.escape(keyword)}\b',
-                                       f'<mark style="background-color: {color};" data-weight="{importance_score}" class="highlight">{keyword}</mark>',
-                                       highlighted_sentence1)
-        highlighted_sentence2 = re.sub(rf'\b{re.escape(keyword)}\b',
-                                       f'<mark style="background-color: {color};" data-weight="{importance_score}" class="highlight">{keyword}</mark>',
-                                       highlighted_sentence2)
+        return " ".join(highlighted_sentence)
 
     return {
-        "keywords": keywords,
-        "sentence1": highlighted_sentence1,
-        "sentence2": highlighted_sentence2
+        "keywords": list(lime_dict.keys()),
+        "sentence1": highlight_text(sentence1),
+        "sentence2": highlight_text(sentence2)
     }
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
