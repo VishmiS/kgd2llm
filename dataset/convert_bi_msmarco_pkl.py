@@ -4,7 +4,7 @@ import os
 import time
 
 # === Config ===
-output_dir = 'ms_marco_pkl'
+output_dir = 'bi_marco_pkl'
 sample_size_fulldocs = 10000  # Set None to load full fulldocs, or integer for sampling
 
 os.makedirs(output_dir, exist_ok=True)

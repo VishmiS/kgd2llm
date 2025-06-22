@@ -195,7 +195,7 @@ def mine_hard_negatives(model, corpus_embeddings, corpus_idx_to_docid, queries, 
             res[query_text].extend(hard_negatives)
 
     # Save hard negatives
-    hard_neg_path = os.path.join(output_dir, 'ms_marco_hard_negatives.pkl')
+    hard_neg_path = os.path.join(output_dir, 'bi_hard_negatives.pkl')
     common_utils.write_pickle(res, hard_neg_path)
     print(f"Hard negatives saved to {hard_neg_path}")
 
@@ -208,9 +208,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', default='T2Ranking', type=str,
                         help='Name of the dataset to use, e.g., "T2Ranking"')
-    parser.add_argument('--fulldocs_pkl', default='../dataset/ms_marco_pkl/fulldocs.pkl', type=str,
+    parser.add_argument('--fulldocs_pkl', default='../dataset/bi_marco_pkl/fulldocs.pkl', type=str,
                         help='Path to full document corpus pickle file')
-    parser.add_argument('--queries_pkl', default='../dataset/ms_marco_pkl/queries.pkl', type=str,
+    parser.add_argument('--queries_pkl', default='../dataset/bi_marco_pkl/queries.pkl', type=str,
                         help='Path to queries pickle file')
     parser.add_argument('--output_dir', default='../dataset/hard_negatives', type=str,
                         help='Output directory to store generated hard negatives and embeddings')

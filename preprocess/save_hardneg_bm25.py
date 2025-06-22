@@ -21,9 +21,9 @@ def preprocess_text(text):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pos_pkl', default='../dataset/snli_multinli_combined_pkl/combined_pos.pkl', type=str,
+    parser.add_argument('--pos_pkl', default='../dataset/bm25_combined_pkl/combined_pos.pkl', type=str,
                         help='Path to positive samples pickle')
-    parser.add_argument('--hn_pkl', default='../dataset/snli_multinli_combined_pkl/combined_hn.pkl', type=str,
+    parser.add_argument('--hn_pkl', default='../dataset/bm25_combined_pkl/combined_hn.pkl', type=str,
                         help='Path to hard negative samples pickle')
     parser.add_argument('--output_dir', default='../dataset/hard_negatives', type=str,
                         help='Output directory for hard negatives')
@@ -82,7 +82,7 @@ def main():
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    output_pickle = os.path.join(args.output_dir, 'snli_multinli_hard_negatives.pkl')
+    output_pickle = os.path.join(args.output_dir, 'bm25_hard_negatives.pkl')
     write_pickle(hard_neg_sample_dict, output_pickle)
 
     print(f"Hard negatives saved to {output_pickle}")

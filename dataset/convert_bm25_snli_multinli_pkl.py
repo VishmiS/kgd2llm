@@ -25,7 +25,7 @@ pos_scores = [1.0] * len(pos_samples)
 hn_scores = [0.0] * len(hn_samples)
 
 # Output directory for combined pickles
-output_dir = 'snli_multinli_combined_pkl'
+output_dir = 'bm25_combined_pkl'
 os.makedirs(output_dir, exist_ok=True)
 
 # Helper function to save pickle and print size
