@@ -213,13 +213,10 @@ def process_dataset(data_name, split, snli_paths, sts_paths, K=10):
         path = snli_paths[f"{split}_path"]
         queries, corpus, pos_sample_dict, global_pos = load_snli_en(path)
         output_pickle_neg = os.path.join(output_dir, f'snli_{split}_neg.pkl')
-        output_pickle_pos = os.path.join(output_dir, f'snli_{split}_pos.pkl')
-
     elif data_name == 'sts':
         path = sts_paths[f"{split}_path"]
         queries, corpus, pos_sample_dict, global_pos = load_sts_csv(path)
         output_pickle_neg = os.path.join(output_dir, f'sts_{split}_neg.pkl')
-        output_pickle_pos = os.path.join(output_dir, f'sts_{split}_pos.pkl')
     else:
         raise ValueError(f"Unsupported dataset: {data_name}")
 
@@ -243,31 +240,11 @@ def process_dataset(data_name, split, snli_paths, sts_paths, K=10):
         global_pos
     )
 
-    # Compute positive logits for each query
-    # pos_logits_dict = compute_positive_logits(queries, pos_sample_dict, model)
 
     # TO GENERATE dict[str, List[Tuple[str, float]]]
     # 📌 Save only the plain hard negatives (no logits)
     write_pickle(hard_neg_sample_dict, output_pickle_neg)
-    # write_pickle(pos_logits_dict, output_pickle_pos)
     print(f"Saved hard negatives to {output_pickle_neg}")
-    print(f"Saved positive logits to {output_pickle_pos}\n")
-
-    # TO GENERATE list[float]
-    # ✅ Extract logits only (List[float]) for saving
-    neg_logits_flat = [0.0 for pairs in hard_neg_sample_dict.values() for _ in pairs]
-    # pos_logits_flat = [score for pairs in pos_logits_dict.values() for (_, score) in pairs]
-
-    # ✅ Save flat lists instead of defaultdicts
-    neg_logits_path = output_pickle_neg.replace(".pkl", "_logits.pkl")
-    pos_logits_path = output_pickle_pos.replace(".pkl", "_logits.pkl")
-
-    write_pickle(neg_logits_flat, neg_logits_path)
-    # write_pickle(pos_logits_flat, pos_logits_path)
-
-    print(f"✅ Saved {len(neg_logits_flat)} negative logits to {neg_logits_path}")
-    # print(f"✅ Saved {len(pos_logits_flat)} positive logits to {pos_logits_path}\n")
-
 
 
 def main():

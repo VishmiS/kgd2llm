@@ -64,8 +64,5 @@ def inspect_logits(file_path, label="", neg_K=8):
 
 if __name__ == "__main__":
     # Set your file paths here
-    pos_file = "snli_train_pos_logits.pkl"
     neg_file = "snli_train_neg.pkl"
-
-    inspect_logits(pos_file, label="POS")
     inspect_logits(neg_file, label="NEG", neg_K=8)
