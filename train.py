@@ -66,6 +66,7 @@ def main():
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--local_rank', type=int, default=-1, help='ds')
     parser.add_argument('--global_rank', type=int, default=-1, help='ds')
+    parser.add_argument('--mark', type=str, default='', help='Mark or label for checkpoint folder naming')
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
     args.world_size = int(os.getenv('WORLD_SIZE', '0'))
@@ -122,7 +123,7 @@ def main():
     "zero_optimization": {
         "stage": 2,
         "offload_optimizer": {
-            "device": "none",
+            "device": "cpu",
             "pin_memory": True
         },
         "allgather_partitions": True,
@@ -209,6 +210,8 @@ def main():
     print("About to start training loop...")
 
     for current_epoch in trange(int(args.num_epochs), desc="Epoch", disable=(args.global_rank != 0), mininterval=0):
+
+        torch.autograd.set_detect_anomaly(True)
         if stop >= args.patience:
             logging.info(f'Early Stop at {current_epoch + 1}-th epoch {global_step}-th step')
             logging.info(f'Model trained!\nThe best model at {best_epoch + 1}-th epoch {best_step}-th step')
@@ -237,8 +240,8 @@ def main():
                 raise IndexError(
                     f"Step {step} out of range for teacher_inbatch_logits_dict[{key}] with length {len(teacher_inbatch_logits_dict[key])}.")
 
-            print(f"Keys in teacher_inbatch_logits_dict: {list(teacher_inbatch_logits_dict.keys())}")
-            print(f"Length of teacher_inbatch_logits_dict[{key}]: {len(teacher_inbatch_logits_dict[key])}")
+            # print(f"Keys in teacher_inbatch_logits_dict: {list(teacher_inbatch_logits_dict.keys())}")
+            # print(f"Length of teacher_inbatch_logits_dict[{key}]: {len(teacher_inbatch_logits_dict[key])}")
 
             value = teacher_inbatch_logits_dict[key][step]
             print(type(value))
@@ -248,9 +251,9 @@ def main():
             feature_teacher_cos = teacher_feature_cos_dict[key][step].to(device)
 
 
-            print(f"Type of teacher_feature_cos_dict[{key}]: {type(teacher_feature_cos_dict[key])}")
-            print(f"Length of teacher_feature_cos_dict[{key}]: {len(teacher_feature_cos_dict[key])}")
-            print(f"Type of first element: {type(teacher_feature_cos_dict[key][0])}")
+            # print(f"Type of teacher_feature_cos_dict[{key}]: {type(teacher_feature_cos_dict[key])}")
+            # print(f"Length of teacher_feature_cos_dict[{key}]: {len(teacher_feature_cos_dict[key])}")
+            # print(f"Type of first element: {type(teacher_feature_cos_dict[key][0])}")
             # print(f"Sample at step {step}: {sample}")
 
 
@@ -270,17 +273,17 @@ def main():
 
             loss_in_batch = cal_loss_in_batch(args, logits_student_in_batch, args.temperature_in_batch, criterion)
             logits_teacher_pos = logits_teacher_pos.to(args.device)
-            print(f"[Debug] logits_teacher_hardneg.shape before reshape: {logits_teacher_hardneg.shape}")
-            print(f"[Debug] Expected reshape: ({micro_bs}, {args.neg_K}, 2) = {micro_bs * args.neg_K * 2}")
-            print(f"[Debug] Actual total elements: {logits_teacher_hardneg.numel()}")
+            # print(f"[Debug] logits_teacher_hardneg.shape before reshape: {logits_teacher_hardneg.shape}")
+            # print(f"[Debug] Expected reshape: ({micro_bs}, {args.neg_K}, 2) = {micro_bs * args.neg_K * 2}")
+            # print(f"[Debug] Actual total elements: {logits_teacher_hardneg.numel()}")
 
             logits_teacher_hardneg = logits_teacher_hardneg.reshape(micro_bs, args.neg_K, 2).to(args.device)
 
-            print(f"logits_teacher_pos.shape: {logits_teacher_pos.shape}")  # Should be [micro_bs, 2]
-            print(f"Type: {type(logits_teacher_pos)}")
-            print(f"Min: {logits_teacher_pos.min()}, Max: {logits_teacher_pos.max()}")
-            print(f"logits_teacher_pos.unsqueeze(1).shape: {logits_teacher_pos.unsqueeze(1).shape}")  # Should be [micro_bs, 1, 2]
-            print(f"logits_teacher_hardneg.shape after reshape: {logits_teacher_hardneg.shape}")  # Should be [micro_bs, neg_K, 2]
+            # print(f"logits_teacher_pos.shape: {logits_teacher_pos.shape}")  # Should be [micro_bs, 2]
+            # print(f"Type: {type(logits_teacher_pos)}")
+            # print(f"Min: {logits_teacher_pos.min()}, Max: {logits_teacher_pos.max()}")
+            # print(f"logits_teacher_pos.unsqueeze(1).shape: {logits_teacher_pos.unsqueeze(1).shape}")  # Should be [micro_bs, 1, 2]
+            # print(f"logits_teacher_hardneg.shape after reshape: {logits_teacher_hardneg.shape}")  # Should be [micro_bs, neg_K, 2]
 
 
             logits_teacher_hardneg = torch.cat([logits_teacher_pos.unsqueeze(1), logits_teacher_hardneg], dim=1)
@@ -290,10 +293,31 @@ def main():
 
             loss_rd = cal_loss_rd(args, logits_teacher_hardneg, logits_student_hardneg, args.temperature_teacher_hardneg)
 
+            # print("[Debug] logits_teacher_hardneg shape:", logits_teacher_hardneg.shape)  # Expect [B, neg_K+1, 2]
+            # print("[Debug] logits_teacher_inbatch shape:", logits_teacher_inbatch.shape)  # Expect [B, in_batch_neg]
+            # print("[Debug] logits_student_hardneg shape:", logits_student_hardneg.shape)
+            # print("[Debug] logits_student_in_batch shape:", logits_student_in_batch.shape)
+
+            batch_size = logits_teacher_inbatch.shape[0]
+            inbatch = logits_teacher_inbatch.shape[1] if logits_teacher_inbatch.dim() == 2 else 1
+            # print(f"[Debug] batch_size = {batch_size}, inbatch = {inbatch}")
+
+            assert logits_teacher_inbatch.shape == (micro_bs, micro_bs - 1, 2)
+
             loss_rd2 = cal_loss_rd2(args, logits_teacher_hardneg, logits_teacher_inbatch, args.temperature_teacher_hardneg,
                                     logits_student_hardneg, logits_student_in_batch, sigmoid, args.scale_param)
 
-            loss_feat = cal_feat_loss(args, feature_teacher_cos, rep_student_pos_hardneg)
+            # Convert raw teacher features to cosine sim matrix
+            feature_teacher_cos = feature_teacher_cos / feature_teacher_cos.norm(dim=-1, keepdim=True)
+            teacher_feat_cos_matrix = torch.matmul(feature_teacher_cos, feature_teacher_cos.transpose(-2, -1))
+
+            loss_feat = cal_feat_loss(args, teacher_feat_cos_matrix, rep_student_pos_hardneg)
+
+            print("loss_in_batch:", loss_in_batch)
+            print("loss_hardneg:", loss_hardneg)
+            print("loss_rd2:", loss_rd2)
+            print("loss_rd:", loss_rd)
+            print("loss_feat:", loss_feat)
 
             loss_batch = loss_in_batch + loss_hardneg + loss_rd2 + loss_rd + loss_feat
             if args.verbose:

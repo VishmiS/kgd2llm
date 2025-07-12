@@ -60,7 +60,7 @@ def load_text_dataset(name, pos_dir, neg_dir, file_path, neg_K, res_data, split)
                 pos_logit_for_sample = pos_logits.get(text_a, None)
                 if pos_logit_for_sample is None:
                     not_found_count += 1
-                    pos_logit_for_sample = [0.0]  # assign default after counting
+                    pos_logit_for_sample = [0.0, 0.0]  # assign default after counting
                 # Then append to data as usual
                 data.append((text_a[:100], text_b[:100], pos_logit_for_sample, hardnegs, hardneg_logits, 0))
 
@@ -184,10 +184,10 @@ def collate_fn(data):
 
 
     # Debug prints for pos logits
-    print("🟢 Total positive logits collected:", len(res_pos_logits))
-    if len(res_pos_logits) > 0:
-        print("🔍 Type of first positive logit sample:", type(res_pos_logits[0]))
-        print("📏 Length of first positive logit sample:", len(res_pos_logits[0]))
+    # print("🟢 Total positive logits collected:", len(res_pos_logits))
+    # if len(res_pos_logits) > 0:
+        # print("🔍 Type of first positive logit sample:", type(res_pos_logits[0]))
+        # print("📏 Length of first positive logit sample:", len(res_pos_logits[0]))
         # If list or numpy array, print length and first few values
         # if isinstance(res_pos_logits[0], (list, np.ndarray)):
         #     print("📏 Length of first positive logit sample:", len(res_pos_logits[0]))
@@ -195,7 +195,7 @@ def collate_fn(data):
         # else:
         #     print("👀 First positive logit sample value:", res_pos_logits[0])
 
-    print("🔴 Total negative logits collected:", len(res_neg_logits))
+    # print("🔴 Total negative logits collected:", len(res_neg_logits))
 
     return res_s_a, res_s_b, torch.FloatTensor(res_pos_logits), res_neg_K, torch.FloatTensor(res_neg_logits), torch.LongTensor(res_task_id)
 
@@ -360,6 +360,6 @@ class ValDataset(Dataset):
         if self.step > self.steps_per_epoch - 1:
             self.step = 0
         batch_indices = self.epoch[self.step * self.num_processes + self.process_index]
-        batch_data = np.array(self.data)[batch_indices].tolist()
+        batch_data = [self.data[i] for i in batch_indices]
         self.step += 1
         return batch_data

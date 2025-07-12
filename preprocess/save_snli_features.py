@@ -88,21 +88,27 @@ def generate_features_and_inbatch(
             final_logits = logits[:, -1, [yes_id, no_id]].cpu().float().numpy().tolist()
             all_logits.extend(final_logits)
 
-            feat_stack = pooled_features
-            feat_norm = F.normalize(feat_stack, p=2, dim=1)
-            cos_sim_matrix = torch.matmul(feat_norm, feat_norm.T)
-            query_ids_batch = query_ids_for_each_sample[sample_index: sample_index + feat_stack.size(0)]
+            batch_logits = logits[:, -1, [yes_id, no_id]].cpu()  # shape: [bs, 2]
 
+            # Compute in-batch logits [bs, bs-1, 2]
+            inbatch_logits = []
+            for i in range(batch_logits.size(0)):
+                others = [j for j in range(batch_logits.size(0)) if j != i]
+                sample_logits = batch_logits[others]  # shape: [bs - 1, 2]
+                inbatch_logits.append(sample_logits)
+
+            # Stack into [bs, bs - 1, 2]
+            inbatch_logits_tensor = torch.stack(inbatch_logits)
+
+            # Store in inbatch_dict
             if f'global_rank{id_shard}' not in inbatch_dict:
                 inbatch_dict[f'global_rank{id_shard}'] = []
 
-            # Make sure the list is long enough
             while len(inbatch_dict[f'global_rank{id_shard}']) <= step:
                 inbatch_dict[f'global_rank{id_shard}'].append(None)
 
-            inbatch_dict[f'global_rank{id_shard}'][step] = cos_sim_matrix.cpu()
+            inbatch_dict[f'global_rank{id_shard}'][step] = inbatch_logits_tensor
 
-            sample_index += feat_stack.size(0)
 
     # Build logits dictionary
     res_dict = {}
@@ -127,7 +133,7 @@ if __name__ == '__main__':
     output_inbatch_pkl_path = "../outputs/inbatch/snli_train_inbatch.pkl"
 
     task_type = "sts"
-    batch_size = 128
+    batch_size = 32
     teacher_max_seq_length = 256
     num_shards = 1
     id_shard = 0
