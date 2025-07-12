@@ -61,16 +61,21 @@ def write_tensorboard(summary_writer, log_dict, completed_steps):
 def cos_sim(a, b):
     if not isinstance(a, torch.Tensor):
         a = torch.tensor(a)
-
     if not isinstance(b, torch.Tensor):
         b = torch.tensor(b)
 
+    # Move to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    a = a.to(device)
+    b = b.to(device)
+
+    # Ensure 2D tensors
     if len(a.shape) == 1:
         a = a.unsqueeze(0)
-
     if len(b.shape) == 1:
         b = b.unsqueeze(0)
 
+    # Normalize and compute cosine similarity
     a_norm = torch.nn.functional.normalize(a, p=2, dim=1)
     b_norm = torch.nn.functional.normalize(b, p=2, dim=1)
     return torch.mm(a_norm, b_norm.transpose(0, 1))

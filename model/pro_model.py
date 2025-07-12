@@ -35,28 +35,35 @@ class PMA(nn.Module):
         nn.init.xavier_uniform_(self.S)
         self.mab = MAB(dim, dim, dim, num_heads, ln=ln)
 
-    def forward(self, X, pad_mask):
-        if self.S.dtype != torch.bfloat16:
-            X = X.float()
-        return self.mab(self.S.repeat(X.size(0), 1, 1), X, pad_mask)
+    # def forward(self, X, pad_mask):
+    #     if self.S.dtype != torch.bfloat16:
+    #         X = X.float()
+    #     return self.mab(self.S.repeat(X.size(0), 1, 1), X, pad_mask)
 
     def forward(self, Q, K, pad_mask=None):
-        Q_ = self.fc_q(Q)
-        K_, V_ = self.fc_k(K), self.fc_v(K)
-        dim_split = self.dim_V // self.num_heads
+        # Ensure Q, K match the dtype of model weights
+        dtype = self.mab.fc_q.weight.dtype
+        Q = Q.to(dtype)
+        K = K.to(dtype)
+
+        Q_ = self.mab.fc_q(Q)
+        K_, V_ = self.mab.fc_k(K), self.mab.fc_v(K)
+
+        dim_split = self.mab.dim_V // self.mab.num_heads
         Q_ = torch.cat(Q_.split(dim_split, 2), 0)
         K_ = torch.cat(K_.split(dim_split, 2), 0)
         V_ = torch.cat(V_.split(dim_split, 2), 0)
-        pad_mask = pad_mask.unsqueeze(1).repeat(self.num_heads, Q.size(1), 1)
-        score = Q_.bmm(K_.transpose(1, 2)) / math.sqrt(self.dim_V)
+
+        pad_mask = pad_mask.unsqueeze(1).repeat(self.mab.num_heads, Q.size(1), 1)
+        score = Q_.bmm(K_.transpose(1, 2)) / math.sqrt(self.mab.dim_V)
         score = score.masked_fill(pad_mask == 0, -1e12)
         A = torch.softmax(score, 2)
         A = A * pad_mask
         O = torch.cat(A.bmm(V_).split(Q.size(0), 0), 2)
         O = Q + O
-        O = O if getattr(self, 'ln0', None) is None else self.ln0(O)
-        O = O + F.relu(self.fc_o(O))
-        O = O if getattr(self, 'ln1', None) is None else self.ln1(O)
+        O = O if getattr(self.mab, 'ln0', None) is None else self.mab.ln0(O)
+        O = O + F.relu(self.mab.fc_o(O))
+        O = O if getattr(self.mab, 'ln1', None) is None else self.mab.ln1(O)
         return O
 
 
@@ -106,17 +113,21 @@ class Mymodel(nn.Module):
         self.args = args
         self.max_seq_length = max_seq_length
         self.model_name_or_path = model_name_or_path
+        self.keep_max_layer = -1 #updated
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path, trust_remote_code=True,
                                                        pad_token='<|endoftext|>', truncation_side='right',
                                                        padding_side=self.args.padding_side)
-        self.tokenizer.pad_token_id = self.tokenizer.eod_id
+        self.tokenizer.pad_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.pad_token)
         self.plm_model = AutoModelForCausalLM.from_pretrained(self.model_name_or_path, trust_remote_code=True)
-        self.emb_dim = self.plm_model.transformer.wte.weight.size(1)
+        self.emb_dim = self.plm_model.config.hidden_size
         self.num_heads = args.num_heads
         self.ln = args.ln
         self.norm = args.norm
         self.mha_pma = PMA(self.emb_dim, self.num_heads, 1, ln=self.ln)
+        self.hidden_dim = 768
+        self.output_dim = 512
         self.iem = IEM(self.emb_dim, self.hidden_dim, self.output_dim)
+
 
     def forward(self, inputs_all, task_ids, mode):
         if mode == 'train':
@@ -154,13 +165,19 @@ class Mymodel(nn.Module):
         return output_in_batch_specific_task, output_hardneg_specific_task, output_pos_hardneg_rep_specific_task
 
     def pma_embedding(self, A, mask):
-        res = self.mha_pma(A, mask).squeeze(1)
+        res = self.mha_pma(self.mha_pma.S.repeat(A.size(0), 1, 1), A, mask).squeeze(1)
         return res
 
     def get_sentence_embedding(self, **inputs):
         outputs = self.plm_model(**inputs, output_hidden_states=True)
-        embedding = outputs.hidden_states[self.keep_max_layer]
         attention_mask = inputs['attention_mask']
+        embedding = outputs.hidden_states[self.keep_max_layer]
+        # Validate embedding shape
+        if embedding.size(-1) != self.emb_dim:
+            raise ValueError(f"Expected embedding dimension {self.emb_dim}, but got {embedding.size(-1)}.")
+
+        # print("attention_mask shape:", attention_mask.shape)  # ✅ Now OK
+        # print("embedding shape:", embedding.shape)  # ✅ Now OK
         res_embedding = self.pma_embedding(embedding, attention_mask)
 
         if self.norm:

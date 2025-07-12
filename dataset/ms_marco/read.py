@@ -1,35 +1,30 @@
-import pandas as pd
 import json
-import textwrap
 
-# Set pandas options to show full content
-pd.set_option('display.max_colwidth', None)
+def print_first_n_records_unstructured(path, n=10):
+    print(f"\n--- Showing first {n} unstructured records from file: {path} ---")
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
 
-# Read the first row from each TSV file
-queries_df = pd.read_csv('docleaderboard-queries.tsv', sep='\t', nrows=1)
-top100_df = pd.read_csv('docleaderboard-top100.tsv', sep='\t', nrows=1)
-fulldocs_df = pd.read_csv('fulldocs.tsv', sep='\t', nrows=1)
+    if isinstance(data, list):
+        # Case: Top-level JSON is a list
+        for i, item in enumerate(data[:n]):
+            val_str = json.dumps(item, indent=2)
+            if len(val_str) > 500:
+                val_str = val_str[:500] + "..."
+            print(f"\nRecord {i+1}:\n{val_str}")
+    elif isinstance(data, dict):
+        # Case: Top-level JSON is a dict
+        for i, (key, val) in enumerate(data.items()):
+            if i >= n:
+                break
+            val_str = json.dumps(val, indent=2)
+            if len(val_str) > 500:
+                val_str = val_str[:500] + "..."
+            print(f"\nKey: {key}\nValue:\n{val_str}")
+    else:
+        print("Unsupported JSON format (not a list or dict at the top level)")
 
-def pretty_print(df, title, wrap_width=80):
-    print(f"\n{'='*100}")
-    print(f"{title.upper()} (first {len(df)} row{'s' if len(df) > 1 else ''})")
-    print(f"{'='*100}\n")
-
-    for i, row in df.iterrows():
-        print(f"Row {i+1}:")
-        print("{")
-        for key, value in row.to_dict().items():
-            key_str = json.dumps(str(key), ensure_ascii=False)
-            val_str = json.dumps(str(value), ensure_ascii=False)
-
-            # Wrap long lines for values
-            wrapped_val = textwrap.fill(val_str, width=wrap_width,
-                                        subsequent_indent=' ' * 6)
-            print(f"  {key_str}: {wrapped_val}")
-        print("}")
-        print('-' * 100)
-
-# Print all three
-pretty_print(queries_df, 'docleaderboard-queries.tsv')
-pretty_print(top100_df, 'docleaderboard-top100.tsv')
-pretty_print(fulldocs_df, 'fulldocs.tsv')
+# Usage example
+# print_first_n_records_unstructured('train_v2.1.json')
+print_first_n_records_unstructured('dev_v2.1.json')
+# print_first_n_records_unstructured('eval_v2.1_public.json')

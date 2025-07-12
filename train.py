@@ -23,14 +23,14 @@ def str2bool(v):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--base_model_dir', default='bert-base-uncased', type=str,
+    parser.add_argument('--base_model_dir', default='/mnt/user/415350/download_models/Qwen-7B-Chat', type=str,
                         help='Model directory')
     parser.add_argument('--train_data_list', nargs='+')
-    parser.add_argument('--pos_dir', default='dataset/bm25_combined_pkl/bm25_combined_pos.pkl', type=str)
-    parser.add_argument('--neg_dir', default='dataset/hard_negatives/bm25_hard_negatives.pkl', type=str)
+    parser.add_argument('--pos_dir', default='PATH_TO_POS_LOGITS', type=str)
+    parser.add_argument('--neg_dir', default='PATH_TO_HARDNEG_LOGITS', type=str)
     parser.add_argument('--data_dir', default='', type=str)
     parser.add_argument('--inbatch_pkl_path_dir', default='PATH_TO_INBATCH_LOGITS_PKL')
-    parser.add_argument('--feature_pkl_path_dir', default='dataset/logits/sts_logits.pkl')
+    parser.add_argument('--feature_pkl_path_dir', default='PATH_TO_FEATURE_PKL')
     parser.add_argument('--batch_size', default=32, type=int, help='bs')
     parser.add_argument('--neg_K', default=8, type=int, help='num of hard negs')
     parser.add_argument('--num_heads', default=32, type=int, help='num_heads of pma')
@@ -122,7 +122,7 @@ def main():
     "zero_optimization": {
         "stage": 2,
         "offload_optimizer": {
-            "device": "gpu",
+            "device": "none",
             "pin_memory": True
         },
         "allgather_partitions": True,
@@ -151,13 +151,13 @@ def main():
     args.device = device
     args.global_rank = torch.distributed.get_rank()
 
+
     train_dataset = TrainDataset(model.tokenizer, pos_dir=args.pos_dir, neg_dir=args.neg_dir, datadir=args.data_dir,
                                  names=args.train_data_list, batch_size=micro_bs, neg_K=args.neg_K,
                                  process_index=args.global_rank, num_processes=args.world_size)
     val_dataset = ValDataset(model.tokenizer, pos_dir=args.pos_dir, neg_dir=args.neg_dir, datadir=args.data_dir,
                              names=args.train_data_list, batch_size=micro_bs, neg_K=args.neg_K,
                              process_index=args.global_rank, num_processes=args.world_size)
-
     if args.global_rank == -1:
         train_sampler = RandomSampler(train_dataset)
         val_sampler = RandomSampler(val_dataset)
@@ -168,6 +168,7 @@ def main():
                                   collate_fn=collate_fn, num_workers=0)
     val_dataloader = DataLoader(val_dataset, batch_size=fake_bs, shuffle=False, sampler=val_sampler, collate_fn=collate_fn,
                                 num_workers=0)
+    print("Length of Train Dataset:",len(train_dataset))
     if len(train_dataset) > 0:
         train_data_flag = True
 
@@ -193,7 +194,7 @@ def main():
     stop = 0
 
     teacher_feature_cos_dict = load_pickle(args.feature_pkl_path_dir)
-    teacher_inbatch = load_pickle(args.inbatch_pkl_path_dir)
+    teacher_inbatch_logits_dict = load_pickle(args.inbatch_pkl_path_dir)
 
     reduce_loss = 0
     reduce_loss_eval = 0
@@ -204,6 +205,8 @@ def main():
     reduce_loss_rd2 = 0
     reduce_loss_feat = 0
     reduce_inbatch_sample_num = {}
+
+    print("About to start training loop...")
 
     for current_epoch in trange(int(args.num_epochs), desc="Epoch", disable=(args.global_rank != 0), mininterval=0):
         if stop >= args.patience:
@@ -224,8 +227,39 @@ def main():
             sentence_all = sentence_a + sentence_b + sentence_hardneg
             bs = logits_teacher_pos.size(0)
             key = 'global_rank' + str(args.global_rank)
-            logits_teacher_inbatch = teacher_logits_dict[key][step].to(device)
+
+
+            if key not in teacher_inbatch_logits_dict:
+                print(f"Available keys in teacher_inbatch_logits_dict: {list(teacher_inbatch_logits_dict.keys())}")
+                raise KeyError(f"Key '{key}' not found in teacher_inbatch_logits_dict.")
+
+            if step >= len(teacher_inbatch_logits_dict[key]):
+                raise IndexError(
+                    f"Step {step} out of range for teacher_inbatch_logits_dict[{key}] with length {len(teacher_inbatch_logits_dict[key])}.")
+
+            print(f"Keys in teacher_inbatch_logits_dict: {list(teacher_inbatch_logits_dict.keys())}")
+            print(f"Length of teacher_inbatch_logits_dict[{key}]: {len(teacher_inbatch_logits_dict[key])}")
+
+            value = teacher_inbatch_logits_dict[key][step]
+            print(type(value))
+
+
+            logits_teacher_inbatch = teacher_inbatch_logits_dict[key][step].to(device)
             feature_teacher_cos = teacher_feature_cos_dict[key][step].to(device)
+
+
+            print(f"Type of teacher_feature_cos_dict[{key}]: {type(teacher_feature_cos_dict[key])}")
+            print(f"Length of teacher_feature_cos_dict[{key}]: {len(teacher_feature_cos_dict[key])}")
+            print(f"Type of first element: {type(teacher_feature_cos_dict[key][0])}")
+            # print(f"Sample at step {step}: {sample}")
+
+
+            # feature_teacher_cos = teacher_feature_cos_dict[key][step].to(device)
+
+            # inner_dict = teacher_feature_cos_dict[key]
+            # query_key = list(inner_dict.keys())[step]
+            # sample2 = inner_dict[query_key]
+            # feature_teacher_cos = [torch.tensor(logits, dtype=torch.float32).to(device) for _, logits in sample2]
 
             inputs_all = model.tokenizer(sentence_all, padding='max_length', max_length=args.max_seq_length,
                                          truncation=True, return_tensors='pt')
@@ -236,8 +270,21 @@ def main():
 
             loss_in_batch = cal_loss_in_batch(args, logits_student_in_batch, args.temperature_in_batch, criterion)
             logits_teacher_pos = logits_teacher_pos.to(args.device)
+            print(f"[Debug] logits_teacher_hardneg.shape before reshape: {logits_teacher_hardneg.shape}")
+            print(f"[Debug] Expected reshape: ({micro_bs}, {args.neg_K}, 2) = {micro_bs * args.neg_K * 2}")
+            print(f"[Debug] Actual total elements: {logits_teacher_hardneg.numel()}")
+
             logits_teacher_hardneg = logits_teacher_hardneg.reshape(micro_bs, args.neg_K, 2).to(args.device)
+
+            print(f"logits_teacher_pos.shape: {logits_teacher_pos.shape}")  # Should be [micro_bs, 2]
+            print(f"Type: {type(logits_teacher_pos)}")
+            print(f"Min: {logits_teacher_pos.min()}, Max: {logits_teacher_pos.max()}")
+            print(f"logits_teacher_pos.unsqueeze(1).shape: {logits_teacher_pos.unsqueeze(1).shape}")  # Should be [micro_bs, 1, 2]
+            print(f"logits_teacher_hardneg.shape after reshape: {logits_teacher_hardneg.shape}")  # Should be [micro_bs, neg_K, 2]
+
+
             logits_teacher_hardneg = torch.cat([logits_teacher_pos.unsqueeze(1), logits_teacher_hardneg], dim=1)
+
             loss_hardneg = cal_loss_hardneg(args, logits_teacher_hardneg, logits_student_hardneg,
                                             args.temperature_teacher_hardneg, args.temperature_hardneg, nll_criterion)
 
@@ -326,7 +373,7 @@ def main():
                         loss_in_batch_dict_eval = cal_loss_in_batch(args, logits_student_in_batch_eval,
                                                                     args.temperature_in_batch, criterion)
 
-                        loss_batch_eval = loss_in_batch.detach()
+                        loss_batch_eval = loss_in_batch_dict_eval.detach()
                         if args.verbose:
                             batch_iterator_eval.set_description(
                                 f"Epoch: {current_epoch + 1}/{args.num_epochs}, Batch:{step}/{len(val_dataloader)}, Loss: {loss_batch_eval:9.4f}")
@@ -377,6 +424,9 @@ def main():
 
                 reduce_loss_eval = 0
                 model_engine.train()
+    print("Training loop finished.")
+
+
 
 if __name__ == '__main__':
     main()
