@@ -114,9 +114,19 @@ class Mymodel(nn.Module):
         self.max_seq_length = max_seq_length
         self.model_name_or_path = model_name_or_path
         self.keep_max_layer = -1 #updated
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path, trust_remote_code=True,
-                                                       pad_token='<|endoftext|>', truncation_side='right',
-                                                       padding_side=self.args.padding_side)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name_or_path,
+            trust_remote_code=True,
+            truncation_side='right',
+            padding_side=self.args.padding_side
+        )
+
+        # Fix pad_token if it's missing
+        if self.tokenizer.pad_token is None:
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.tokenizer.pad_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.pad_token)
         self.plm_model = AutoModelForCausalLM.from_pretrained(self.model_name_or_path, trust_remote_code=True)
         self.emb_dim = self.plm_model.config.hidden_size

@@ -1,6 +1,7 @@
 import warnings
 import logging
 from utils.common_utils import *
+import torch.nn.functional as F
 
 logging.getLogger().setLevel(logging.INFO)
 warnings.filterwarnings('ignore')
@@ -16,13 +17,14 @@ def check_tensor(name, tensor):
         print(f"[LARGE VALUE DETECTED] in {name}, max: {tensor.abs().max().item()}")
 
 
-def cal_loss_in_batch(student_logits, temperature, criterion):
+def cal_loss_in_batch(args, student_logits, temperature, criterion):
     bs = student_logits.size(0)
     logits = student_logits / temperature
     labels = torch.arange(bs, device=logits.device)
 
-    # Assuming criterion returns scalar loss with default reduction='mean'
-    loss = criterion(logits, labels)
+    loss_bs = criterion(logits, labels)
+    loss = loss_bs.sum() / (bs * bs)
+
     return loss
 
 
@@ -33,8 +35,7 @@ def cal_loss_hardneg(args, teacher_logits, student_logits, temperature_teacher, 
         raise ValueError("temperature_teacher must be > 0!")
 
     def softmax(X, temp):
-        X = (X / temp).exp()
-        return X / (X.sum(-1, keepdims=True) + 1e-20)
+        return torch.nn.functional.softmax(X / temp, dim=-1)
 
     bs = teacher_logits.size(0)
     neg_K = teacher_logits.size(1) - 1
@@ -64,44 +65,28 @@ def cal_loss_hardneg(args, teacher_logits, student_logits, temperature_teacher, 
 def cal_loss_rd(args, teacher_logits, student_logits, teacher_temperature):
     loss_pearson_weight = args.beta
 
-    def softmax(X, temp):
-        X = X / temp
-        max_vals, _ = X.max(dim=-1, keepdim=True)
-        X = X - max_vals
-        X = X.exp()
-        res = X / (X.sum(-1, keepdim=True) + 1e-20)
-        return res
+    # Softmax with temperature (using PyTorch's F.softmax for clarity and stability)
+    teacher_probs = F.softmax(teacher_logits / teacher_temperature, dim=-1)[:, :, 0]
 
-    def pearsonr(x, y, batch_first=True):
-        assert x.shape == y.shape
-        dim = -1 if batch_first else 0
-        assert x.shape[dim] > 1
+    # Pearson correlation function (batch-wise)
+    def pearsonr(x, y, dim=-1):
+        vx = x - x.mean(dim=dim, keepdim=True)
+        vy = y - y.mean(dim=dim, keepdim=True)
+        cov = (vx * vy).sum(dim=dim, keepdim=True) / (x.size(dim) - 1)
+        std_x = x.std(dim=dim, keepdim=True)
+        std_y = y.std(dim=dim, keepdim=True)
+        corr = cov / (std_x * std_y + 1e-8)
+        return corr.squeeze(dim)
 
-        centered_x = x - x.mean(dim=dim, keepdim=True)
-        centered_y = y - y.mean(dim=dim, keepdim=True)
-
-        covariance = (centered_x * centered_y).sum(dim=dim, keepdim=True)
-        bessel_corrected_covariance = covariance / (x.shape[dim] - 1)
-
-        x_std = x.std(dim=dim, keepdim=True)
-        y_std = y.std(dim=dim, keepdim=True)
-
-        denom = (x_std * y_std) + 1e-8
-        corr = bessel_corrected_covariance / denom
-
-        return corr
-
-    bs = student_logits.size(0)
-
-    teacher_logits = softmax(teacher_logits, teacher_temperature)[:, :, 0]
-
-    spearson = pearsonr(student_logits, teacher_logits).squeeze()
+    # Calculate correlation per sample in batch
+    spearson = pearsonr(student_logits, teacher_probs, dim=-1)
 
     loss_bs = 1 - spearson
 
     loss_bs = loss_bs * loss_pearson_weight
 
-    return loss_bs.sum() / bs
+    # Average loss over batch
+    return loss_bs.mean()
 
 
 def cal_loss_rd2(args, teacher_logits_pos_hardneg, teacher_logits_pos_inbatch, teacher_temperature,

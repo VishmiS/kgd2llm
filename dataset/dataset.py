@@ -80,27 +80,77 @@ def load_text_dataset(name, pos_dir, neg_dir, file_path, neg_K, res_data, split)
     return res_data, sample_num
 
 
-def load_sts_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
+def load_sts_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data, split='train'):
+    import csv, math, random
+
+    print(f"\n🔄 Loading dataset '{name}' split='{split}'")
+    print(f"  ▶️ Positive pickle file: {pos_dir}")
+    print(f"  ▶️ Negative pickle file: {neg_dir}")
+    print(f"  ▶️ Data file: {file_path}\n")
+
     data = []
-    pos_logits = load_pickle(pos_dir)
-    hard_neg_house = load_pickle(neg_dir)
+    missing_hard_neg_count = 0
+    not_found_count = 0
+
+    # Load pickles depending on split
+    if split == 'train':
+        hard_neg_house = load_pickle(neg_dir)
+        pos_logits = load_pickle(pos_dir)
+    else:
+        hard_neg_house = {}
+        pos_logits = load_pickle(pos_dir)
+
     with open(file_path, encoding='utf-8') as f:
-        reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
+        reader = csv.DictReader(f, delimiter=',', quoting=csv.QUOTE_MINIMAL)
+        print(f"🔑 CSV Header Columns for file '{file_path}':", reader.fieldnames)
+
         for id, row in enumerate(reader):
             text_a = row['sentence1']
             text_b = row['sentence2']
-            if len(hard_neg_house[text_a]) < neg_K:
-                num = math.ceil(neg_K / len(hard_neg_house[text_a]))
-                negs_logits = random.sample(hard_neg_house[text_a] * num, neg_K)
-            else:
-                negs_logits = random.sample(hard_neg_house[text_a], neg_K)
-            hardnegs, hardneg_logits = zip(*negs_logits)
-            hardnegs, hardneg_logits = list(hardnegs), list(hardneg_logits)
-            hardnegs = [sample[:100] for sample in hardnegs]
-            data.append((text_a[:100], text_b[:100], pos_logits, hardnegs, hardneg_logits, 0))
 
-    sample_num = len(data)
-    res_data.extend(data)
+            # Training-specific logic
+            if split == 'train':
+                neg_list = hard_neg_house.get(text_a, [])
+                if not neg_list:
+                    missing_hard_neg_count += 1
+                    continue
+
+                if len(neg_list) < neg_K:
+                    num = math.ceil(neg_K / len(neg_list))
+                    negs_logits = random.sample(neg_list * num, neg_K)
+                else:
+                    negs_logits = random.sample(neg_list, neg_K)
+
+                hardnegs, hardneg_logits = zip(*negs_logits)
+                hardnegs = [sample[:100] for sample in hardnegs]
+                hardneg_logits = list(hardneg_logits)
+            else:
+                hardnegs, hardneg_logits = [], []
+
+            # Get positive logits
+            pos_logit_for_sample = pos_logits.get(text_a)
+            if pos_logit_for_sample is None:
+                not_found_count += 1
+                pos_logit_for_sample = [0.0, 0.0]
+
+            # Trim sentences to 100 characters
+            data.append((text_a[:100], text_b[:100], pos_logit_for_sample, hardnegs, hardneg_logits, 0))
+
+    # Reporting
+    if split == 'train':
+        print(f"⚠️ Total queries with NO hard negatives: {missing_hard_neg_count}")
+    print(f"📉 Pos logits not found for {not_found_count} samples.")
+
+    # Optional split logic
+    if split == 'train':
+        split_data = data[:-10000] if len(data) > 10000 else data
+    elif split == 'validation':
+        split_data = data[-10000:] if len(data) > 10000 else data
+    else:
+        split_data = data
+
+    sample_num = len(split_data)
+    res_data.extend(split_data)
 
     return res_data, sample_num
 
@@ -108,7 +158,7 @@ def load_sts_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
 def load_sts_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
     data = []
     with open(file_path, encoding='utf-8') as f:
-        reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
+        reader = csv.DictReader(f, delimiter=',', quoting=csv.QUOTE_MINIMAL)
         for id, row in enumerate(reader):
             text_a = row['sentence1']
             text_b = row['sentence2']
@@ -232,9 +282,9 @@ class TrainDataset(Dataset):
             elif name in ['sts']:
                 if name == 'sts':
                     start_id = len(self.data)
-                    self.data, sample_num = load_sts_dataset_train(name, os.path.join(pos_dir, 'neg_faiss/sts_train_pos.pkl'),
+                    self.data, sample_num = load_sts_dataset_train(name, os.path.join(pos_dir, 'pos_emb/sts_train_pos_emb.pkl'),
                                                                    os.path.join(neg_dir, 'logits/sts_train_logits.pkl'),
-                                                                   datadir,
+                                                                   os.path.join(datadir, 'sts/train.csv'),
                                                                    self.neg_K, self.data)
                     end_id = len(self.data)
                     self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
@@ -313,9 +363,9 @@ class ValDataset(Dataset):
             elif name in ['sts']:
                 if name == 'sts':
                     start_id = len(self.data)
-                    self.data, sample_num = load_sts_dataset_val(name, os.path.join(pos_dir, 'neg_faiss/sts_val_pos.pkl'),
+                    self.data, sample_num = load_sts_dataset_val(name, os.path.join(pos_dir, 'pos_emb/sts_val_pos_emb.pkl'),
                                                                  os.path.join(neg_dir, 'logits/sts_val_logits.pkl'),
-                                                                 datadir, self.neg_K,
+                                                                 os.path.join(datadir, 'sts/validation.csv'), self.neg_K,
                                                                  self.data)
                     end_id = len(self.data)
                     self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)

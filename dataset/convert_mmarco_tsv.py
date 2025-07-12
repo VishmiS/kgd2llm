@@ -89,3 +89,4 @@ def process_ms_marco_json(json_path, output_dir):
 # Example usage:
 process_ms_marco_json('ms_marco/dev_v2.1.json', 'ms_marco/dev')
 process_ms_marco_json('ms_marco/train_v2.1.json', 'ms_marco/train')
+process_ms_marco_json('ms_marco/eval_v2.1_public.json', 'ms_marco/test')
