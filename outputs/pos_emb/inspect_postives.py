@@ -1,7 +1,7 @@
 import pickle
 
 # 🔧 Set the path to your .pkl file here
-pkl_path = "snli_train_pos_emb.pkl"
+pkl_path = "webq_val_pos_emb.pkl"
 
 def inspect_pickle(pkl_path):
     try:
