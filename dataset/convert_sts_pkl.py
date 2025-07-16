@@ -6,7 +6,7 @@ csv_dir = "../dataset/sts"
 pkl_dir = "../dataset/pkl/2sts"
 os.makedirs(pkl_dir, exist_ok=True)
 
-splits = ['train', 'validation', 'test']  # Adjust if your files use 'dev' instead of 'validation'
+splits = ['train', 'validation', 'test']  # Adjust if your files use 'val' instead of 'validation'
 
 for split in splits:
     csv_path = os.path.join(csv_dir, f"{split}.csv")

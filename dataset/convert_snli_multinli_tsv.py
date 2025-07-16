@@ -29,7 +29,7 @@ def convert_jsonl_to_tsv(jsonl_path, tsv_output_path, dataset_name):
 if __name__ == '__main__':
     snli_files = {
         'train': ('snli_1.0/snli_1.0_train.jsonl',  'snli_1.0/snli_1.0_train.tsv'),
-        'dev':   ('snli_1.0/snli_1.0_dev.jsonl',    'snli_1.0/snli_1.0_dev.tsv'),
+        'val':   ('snli_1.0/snli_1.0_dev.jsonl',    'snli_1.0/snli_1.0_dev.tsv'),
         'test':  ('snli_1.0/snli_1.0_test.jsonl',   'snli_1.0/snli_1.0_test.tsv'),
     }
 

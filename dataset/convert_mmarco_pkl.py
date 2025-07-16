@@ -30,5 +30,5 @@ def convert_positives_tsv_to_pickle(tsv_path, output_pkl_path):
 
 # Example usage:
 convert_positives_tsv_to_pickle("ms_marco/train/positives.tsv", "pkl/3mmarco/train_positives.pkl")
-convert_positives_tsv_to_pickle("ms_marco/dev/positives.tsv", "pkl/3mmarco/dev_positives.pkl")
+convert_positives_tsv_to_pickle("ms_marco/val/positives.tsv", "pkl/3mmarco/dev_positives.pkl")
 convert_positives_tsv_to_pickle("ms_marco/test/positives.tsv", "pkl/3mmarco/test_positives.pkl")

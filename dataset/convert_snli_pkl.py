@@ -28,7 +28,7 @@ if __name__ == '__main__':
     snli_paths = {
         'train': 'processed/snli_1.0_train.tsv',
         'test':  'processed/snli_1.0_test.tsv',
-        'dev':   'processed/snli_1.0_dev.tsv'
+        'val':   'processed/snli_1.0_dev.tsv'
     }
 
     # Output directory

@@ -83,10 +83,10 @@ def process_ms_marco_json(json_path, output_dir):
     save_tsv(queries, os.path.join(output_dir, 'queries.tsv'), ['id', 'query'])
     save_tsv(positives, os.path.join(output_dir, 'positives.tsv'), ['sentence1', 'sentence2'])
 
-    # Create qrels file for both dev and train sets
+    # Create qrels file for both val and train sets
     create_qrels(data, output_dir)
 
 # Example usage:
-process_ms_marco_json('ms_marco/dev_v2.1.json', 'ms_marco/dev')
+process_ms_marco_json('ms_marco/dev_v2.1.json', 'ms_marco/val')
 process_ms_marco_json('ms_marco/train_v2.1.json', 'ms_marco/train')
 process_ms_marco_json('ms_marco/eval_v2.1_public.json', 'ms_marco/test')

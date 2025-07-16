@@ -8,7 +8,7 @@ from loguru import logger
 import random
 from utils.common_utils import load_pickle
 
-DATASET_ID_DICT = {'snli': 1, 'sts': 2, 'mmarco': 3}
+DATASET_ID_DICT = {'snli': 1, 'sts': 2, 'mmarco': 3, 'wq': 4}
 
 
 def load_text_dataset(name, pos_dir, neg_dir, file_path, neg_K, res_data, split):
@@ -170,25 +170,51 @@ def load_sts_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
     return res_data, sample_num
 
 
-def load_mmarco_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
+def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
+    print(f"\n🔄 Loading dataset '{name}'")
+    print(f"  ▶️ Positive pickle file: {pos_dir}")
+    print(f"  ▶️ Negative pickle file: {neg_dir}")
+    print(f"  ▶️ Data file (TSV/JSONL): {file_path}\n")
     data = []
     pos_logits = load_pickle(pos_dir)
     hard_neg_house = load_pickle(neg_dir)
+    missing_hard_neg_count = 0
+    not_found_count = 0
+
     with open(file_path, encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
         for id, row in enumerate(reader):
             text_a = row['sentence1']
             text_b = row['sentence2']
-            if len(hard_neg_house[text_a]) < neg_K:
-                num = math.ceil(neg_K / len(hard_neg_house[text_a]))
-                negs_logits = random.sample(hard_neg_house[text_a] * num, neg_K)
+
+            # Check for hard negatives
+            neg_list = hard_neg_house.get(text_a, [])
+            if not neg_list:
+                missing_hard_neg_count += 1
+                continue
+
+            if len(neg_list) < neg_K:
+                num = math.ceil(neg_K / len(neg_list))
+                negs_logits = random.sample(neg_list * num, neg_K)
             else:
-                negs_logits = random.sample(hard_neg_house[text_a], neg_K)
+                negs_logits = random.sample(neg_list, neg_K)
 
             hardnegs, hardneg_logits = zip(*negs_logits)
-            hardnegs, hardneg_logits = list(hardnegs), list(hardneg_logits)
             hardnegs = [sample[:320] for sample in hardnegs]
-            data.append((text_a[:50], text_b[:320], pos_logits, hardnegs, hardneg_logits, 1))
+            hardneg_logits = list(hardneg_logits)
+
+            # Lookup positive logit vector for this sample
+            pos_logit_for_sample = pos_logits.get(text_a)
+            if pos_logit_for_sample is None:
+                not_found_count += 1
+                # Assuming pos_logits are length 2 vectors, adjust if needed
+                pos_logit_for_sample = [0.0, 0.0]
+
+            data.append((text_a[:50], text_b[:320], pos_logit_for_sample, hardnegs, hardneg_logits, 1))
+
+    if missing_hard_neg_count > 0:
+        print(f"⚠️ Total queries with NO hard negatives: {missing_hard_neg_count}")
+    print(f"📉 Pos logits not found for {not_found_count} samples.")
 
     sample_num = len(data)
     res_data.extend(data)
@@ -196,9 +222,7 @@ def load_mmarco_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data
     return res_data, sample_num
 
 
-
-
-def load_mmarco_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
+def load_qa_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
     data = []
     with open(file_path, encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
@@ -289,18 +313,30 @@ class TrainDataset(Dataset):
                     end_id = len(self.data)
                     self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
                     self.sample_stas[name] = sample_num
-            elif name in ['t2', 'du', 'mmarco', 'cmedqa']:
+            elif name in ['t2', 'du', 'mmarco', 'wq']:
                 if name == 'mmarco':
                     start_id = len(self.data)
-                    self.data, sample_num = load_mmarco_dataset_train(name, os.path.join(pos_dir, 'pkl/3mmarco/train_positives.pkl'),
-                                                                      os.path.join(neg_dir, 'neg_bi/train/query_hard_negatives.pkl'),
+                    self.data, sample_num = load_qa_dataset_train(name, os.path.join(pos_dir, 'pos_emb/mmarco_train_pos_emb.pkl'),
+                                                                      os.path.join(neg_dir, 'logits/mmarco_train_logits.pkl'),
                                                                       os.path.join(datadir, 'ms_marco/train/positives.tsv'), self.neg_K,
+                                                                      self.data)
+                    end_id = len(self.data)
+                    self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
+                    self.sample_stas[name] = sample_num
+
+                elif name == 'wq':
+                    start_id = len(self.data)
+                    self.data, sample_num = load_qa_dataset_train(name, os.path.join(pos_dir, 'pos_emb/webq_train_pos_emb.pkl'),
+                                                                      os.path.join(neg_dir, 'logits/webq_train_logits.pkl'),
+                                                                      os.path.join(datadir, 'web_questions/train/positives.tsv'), self.neg_K,
                                                                       self.data)
                     end_id = len(self.data)
                     self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
                     self.sample_stas[name] = sample_num
             else:
                 logger.debug('Unknown dataset: {}'.format(name))
+
+
 
         print(f"[DEBUG] TrainDataset initialized with {len(self.data)} samples.")
         self.create_epoch()
@@ -370,18 +406,26 @@ class ValDataset(Dataset):
                     end_id = len(self.data)
                     self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
                     self.sample_stas[name] = sample_num
-            elif name in ['t2', 'du', 'mmarco', 'cmedqa']:
+            elif name in ['t2', 'du', 'mmarco', 'wq']:
 
                 if name == 'mmarco':
                     start_id = len(self.data)
-                    self.data, sample_num = load_mmarco_dataset_val(name, os.path.join(pos_dir, 'pkl/3mmarco/dev_positives.pkl'),
-                                                                    os.path.join(neg_dir, 'neg_bi/dev/query_hard_negatives.pkl'),
-                                                                    os.path.join(datadir, 'ms_marco/dev/positives.tsv'), self.neg_K,
+                    self.data, sample_num = load_qa_dataset_val(name, os.path.join(pos_dir, 'pos_emb/mmarco_val_pos_emb.pkl'),
+                                                                    os.path.join(neg_dir, 'logits/mmarco_val_logits.pkl'),
+                                                                    os.path.join(datadir, 'ms_marco/val/positives.tsv'), self.neg_K,
                                                                     self.data)
                     end_id = len(self.data)
                     self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
                     self.sample_stas[name] = sample_num
-
+                elif name == 'wq':
+                    start_id = len(self.data)
+                    self.data, sample_num = load_qa_dataset_train(name, os.path.join(pos_dir, 'pos_emb/webq_val_pos_emb.pkl'),
+                                                                      os.path.join(neg_dir, 'logits/webq_val_logits.pkl'),
+                                                                      os.path.join(datadir, 'web_questions/val/positives.tsv'), self.neg_K,
+                                                                      self.data)
+                    end_id = len(self.data)
+                    self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
+                    self.sample_stas[name] = sample_num
             else:
                 logger.debug('Unknown dataset: {}'.format(name))
         self.create_epoch()
