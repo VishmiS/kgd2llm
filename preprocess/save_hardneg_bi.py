@@ -31,11 +31,11 @@ while True:
 
 # Set your config here
 config = {
-    'sets': ['train', 'dev'],
+    'sets': ['train', 'val'],
     'base_dir': 'dataset/ms_marco',  # directory containing train/test tsv files
     'output_base': 'outputs/neg_bi',
-    'model_name': 'bert-base-uncased',
-    'K': 100,
+    'model_name': 'sentence-transformers/all-MiniLM-L6-v2',
+    'K': 20,
     'max_seq_len': 250,
     'use_sample': False,           # Toggle this to enable/disable sampling
     'sample_limit': 10000           # How many samples to use when sampling
@@ -132,37 +132,32 @@ def save_corpus(model, tsv_path, output_dir):
     write_pickle(embeddings, os.path.join(output_dir, 'corpus_embeddings.pkl'))
     print(f"Saved corpus_embeddings.pkl at {output_dir}")
 
-def save_queries_and_hard_negatives(model, query_path, positive_path, corpus_embeddings_path,
+def save_queries_and_hard_negatives(model, positive_path, corpus_embeddings_path,
                                     corpus_texts_path, K, output_path):
     queries = []
-    pos_dict = defaultdict(list)
+    pos_dict = defaultdict(set)
+    bad_rows = []
 
     with open(positive_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
         for row in reader:
-            q = row.get('sentence1')
-            a = row.get('sentence2')
-            if q is None or a is None:
-                # Skip rows where these fields are missing or None
-                continue
-            q = q.strip()
-            a = a.strip()
+            q = (row.get('sentence1') or '').strip()
+            a = (row.get('sentence2') or '').strip()
             if not q or not a:
-                # Skip if empty after stripping
-                continue
-            queries.append(q)
-            pos_dict[q].append(a)
-            if config.get('use_sample', False) and len(queries) >= config.get('sample_limit', float('inf')):
-                break
+                bad_rows.append({'sentence1': q, 'sentence2': a})
+            if q and a:
+                queries.append(q)
+                pos_dict[q].add(a)
+                if config.get('use_sample', False) and len(queries) >= config.get('sample_limit', float('inf')):
+                    break
 
-    print(f"Number of queries read: {len(queries)}")
-    print(f"Number of queries with positives: {len(pos_dict)}")
+    print(f"Queries loaded: {len(queries)}")
 
     corpus_texts = load_pickle(corpus_texts_path)
     corpus_embeddings = load_pickle(corpus_embeddings_path)
     query_embeddings = model.encode(queries, batch_size=256, max_seq_length=100)
+
     write_pickle(query_embeddings, os.path.join(os.path.dirname(output_path), 'query_embeddings.pkl'))
-    print(f"Saved query_embeddings.pkl at {os.path.dirname(output_path)}")
 
     corpus_embs = corpus_embeddings.astype('float32')
     query_embs = query_embeddings.astype('float32')
@@ -170,20 +165,30 @@ def save_queries_and_hard_negatives(model, query_path, positive_path, corpus_emb
     index = faiss.IndexFlatIP(corpus_embs.shape[1])
     index.add(corpus_embs)
 
-    D, I = index.search(query_embs, K + 10)
+    search_k = K + 50
+    D, I = index.search(query_embs, search_k)
 
     result = defaultdict(list)
-    for i, neighbors in enumerate(I):
+
+    for i, (neighbors, scores) in enumerate(zip(I, D)):
         q = queries[i]
-        for idx in neighbors:
+        seen = set()
+        for idx, score in zip(neighbors, scores):
             candidate = corpus_texts[idx]
-            if candidate not in pos_dict[q] and candidate not in result[q]:
-                result[q].append(candidate)
+            if not candidate or candidate == q or candidate in pos_dict[q] or candidate in seen:
+                continue
+            if score < 0.1:
+                continue
+            seen.add(candidate)
+            result[q].append(candidate)
             if len(result[q]) >= K:
                 break
 
+    for q in queries:
+        result[q] = result[q][:K]
+
     write_pickle(result, output_path)
-    print(f"Saved query_hard_negatives.pkl at {output_path}")
+    print(f"Hard negatives saved to: {output_path}")
 
 def process_dataset(split: str, model: BaseBertModel):
     base_dir = config['base_dir']
@@ -197,11 +202,10 @@ def process_dataset(split: str, model: BaseBertModel):
     ensure_dir(output_dir)
 
     corpus_path = os.path.join(input_dir, 'corpus.tsv')
-    query_path = os.path.join(input_dir, 'queries.tsv')
     positive_path = os.path.join(input_dir, 'positives.tsv')
 
     # You might want to check if these input files exist before continuing:
-    for f in [corpus_path, query_path, positive_path]:
+    for f in [corpus_path, positive_path]:
         if not os.path.isfile(f):
             raise FileNotFoundError(f"Expected file not found: {f}")
         else:
@@ -211,7 +215,6 @@ def process_dataset(split: str, model: BaseBertModel):
 
     save_queries_and_hard_negatives(
         model=model,
-        query_path=query_path,
         positive_path=positive_path,
         corpus_embeddings_path=os.path.join(output_dir, 'corpus_embeddings.pkl'),
         corpus_texts_path=os.path.join(output_dir, 'corpus_texts.pkl'),

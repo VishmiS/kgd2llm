@@ -1,11 +1,11 @@
 #!/bin/bash
 BASE_MODEL_DIR="gpt2"
-TRAIN_DATA_LIST="snli"
+TRAIN_DATA_LIST="mmarco"
 POS_DIR="outputs"
 NEG_DIR="outputs"
 DATA_DIR="dataset"
-INBATCH_PKL_PATH_DIR="outputs/inbatch/snli_train_inbatch.pkl"
-FEATURE_PKL_PATH_DIR="outputs/features/snli_train_features.pkl"
+INBATCH_PKL_PATH_DIR="outputs/inbatch/mmarco_train_inbatch.pkl"
+FEATURE_PKL_PATH_DIR="outputs/features/mmarco_train_features.pkl"
 BATCH_SIZE=32
 NEG_K=8
 NUM_HEADS=32
@@ -31,7 +31,7 @@ TB_DIR="PATH_TO_TENSORBOARD_PATH"
 PATIENCE=5
 NUM_CKPT=4
 TRAINING_LOG="PATH_TO_TRAINING_LOG"
-OUTPUT_DIR="PATH_TO_OUTPUT_MODEL"
+OUTPUT_DIR="PATH_TO_OUTPUT_MODEL/mmarco"
 
 WORLD_SIZE=${WORLD_SIZE:-1}
 NODE_RANK=${RANK:-0}

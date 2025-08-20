@@ -21,6 +21,77 @@ warnings.filterwarnings('ignore')
 def str2bool(v):
     return v.lower() in ('yes', 'true', 't', '1')
 
+def evaluate_and_save(model_engine, val_dataloader, model, args, current_epoch, global_step, summary_writer, criterion,
+                      min_reduce_loss_eval, best_epoch, best_step, stop):
+    device = args.device
+    val_loader_size = len(val_dataloader)
+    reduce_loss_eval = torch.tensor(0.0).to(device)
+
+    model_engine.eval()
+    batch_iterator_eval = tqdm(val_dataloader,
+                               disable=(args.global_rank != 0),
+                               mininterval=0)
+
+    with torch.no_grad():
+        for step, batch in enumerate(batch_iterator_eval):
+            sentence_a, sentence_b, _, _, _, task_id = batch
+            sentence_all = sentence_a + sentence_b
+
+            inputs_all = model.tokenizer(sentence_all, padding='max_length', max_length=args.max_seq_length,
+                                         truncation=True, return_tensors='pt')
+            inputs_all = inputs_all.to(device)
+            task_id = task_id.to(device)
+
+            logits_student_in_batch_eval, _, _ = model_engine(inputs_all, task_id, 'eval')
+
+            loss_in_batch_dict_eval = cal_loss_in_batch(args, logits_student_in_batch_eval,
+                                                        args.temperature_in_batch, criterion)
+            loss_batch_eval = loss_in_batch_dict_eval.detach()
+            if args.verbose:
+                batch_iterator_eval.set_description(
+                    f"Epoch: {current_epoch + 1}/{args.num_epochs}, Batch:{step}/{len(val_dataloader)}, Loss: {loss_batch_eval:9.4f}")
+
+            reduce_loss_eval += loss_batch_eval
+
+    dist.all_reduce(reduce_loss_eval, op=dist.ReduceOp.SUM)
+    reduce_loss_eval = reduce_loss_eval.item() / (val_loader_size * args.world_size)
+
+    if args.global_rank == 0:
+        eval_log_dict = {'loss_eval': reduce_loss_eval}
+        write_tensorboard(summary_writer, eval_log_dict, global_step)
+
+    save_flag = False
+
+    if stop >= args.patience:
+        return stop, min_reduce_loss_eval, best_epoch, best_step, True  # early stop signal
+
+    if reduce_loss_eval <= min_reduce_loss_eval:
+        min_reduce_loss_eval = reduce_loss_eval
+        best_epoch = current_epoch
+        best_step = global_step
+        stop = 0
+
+        if args.global_rank == 0:
+            print('removing')
+            try:
+                remove_earlier_ckpt(args.output_dir, 'checkpoint', global_step, max_save_num=2)
+            except:
+                print('No ckpt to remove.')
+    else:
+        stop += 1
+
+    if stop < args.num_ckpt:
+        save_flag = True
+
+    if save_flag and args.global_rank == 0:
+        output_dir_current = os.path.join(
+            args.output_dir, f"checkpoint-{global_step}-epoch-{current_epoch + 1}-{args.mark}")
+        save_model(model_engine, output_dir_current, client_state=dict())
+
+    model_engine.train()
+    return stop, min_reduce_loss_eval, best_epoch, best_step, False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--base_model_dir', default='/mnt/user/415350/download_models/Qwen-7B-Chat', type=str,
@@ -193,6 +264,7 @@ def main():
     min_reduce_loss_eval = float('inf')
     best_epoch = 0
     stop = 0
+    best_step = 0
 
     teacher_feature_cos_dict = load_pickle(args.feature_pkl_path_dir)
     teacher_inbatch_logits_dict = load_pickle(args.inbatch_pkl_path_dir)
@@ -324,6 +396,9 @@ def main():
                 batch_iterator.set_description(
                     f"Epoch: {current_epoch + 1}/{args.num_epochs}, Batch:{step}/{len(train_dataloader)}, Loss: {loss_batch:9.4f}")
 
+            # Before backward
+            model_engine.zero_grad()
+
             model_engine.backward(loss_batch)
             model_engine.step()
 
@@ -373,81 +448,11 @@ def main():
                 reduce_loss_rd2 = 0
                 reduce_loss_feat = 0
                 reduce_loss_in_batch = 0
+        stop, min_reduce_loss_eval, best_epoch, best_step, early_stop = evaluate_and_save(
+            model_engine, val_dataloader, model, args, current_epoch, global_step, summary_writer,
+            criterion, min_reduce_loss_eval, best_epoch, best_step, stop
+        )
 
-            if global_step % args.eval_interval == 0:
-                model_engine.eval()
-                batch_iterator_eval = tqdm(val_dataloader,
-                                           disable=(args.global_rank != 0),
-                                           mininterval=0)
-
-                with torch.no_grad():
-                    for step, batch in enumerate(batch_iterator_eval):
-                        sentence_a, sentence_b, _, _, _, task_id = batch
-                        sentence_all = sentence_a + sentence_b
-
-                        key = 'global_rank' + str(args.global_rank)
-
-                        inputs_all = model.tokenizer(sentence_all, padding='max_length', max_length=args.max_seq_length,
-                                                     truncation=True, return_tensors='pt')
-
-                        inputs_all = inputs_all.to(device)
-                        task_id = task_id.to(device)
-                        logits_student_in_batch_eval, _, _ = model_engine(inputs_all, task_id, 'eval')
-
-                        loss_in_batch_dict_eval = cal_loss_in_batch(args, logits_student_in_batch_eval,
-                                                                    args.temperature_in_batch, criterion)
-
-                        loss_batch_eval = loss_in_batch_dict_eval.detach()
-                        if args.verbose:
-                            batch_iterator_eval.set_description(
-                                f"Epoch: {current_epoch + 1}/{args.num_epochs}, Batch:{step}/{len(val_dataloader)}, Loss: {loss_batch_eval:9.4f}")
-
-                        reduce_loss_eval += loss_batch_eval
-
-                    dist.all_reduce(reduce_loss_eval, op=dist.ReduceOp.SUM)
-                    reduce_loss_eval = reduce_loss_eval.item() / (val_loader_size * args.world_size)
-
-                    if args.global_rank == 0:
-                        eval_log_dict = {'loss_eval': reduce_loss_eval}
-                        write_tensorboard(summary_writer, eval_log_dict, global_step)
-
-                save_flag = False
-
-                if stop >= args.patience:
-                    break
-
-                if reduce_loss_eval <= min_reduce_loss_eval:
-                    min_reduce_loss_eval = reduce_loss_eval
-                    best_epoch = current_epoch
-                    best_step = global_step
-                    stop = 0
-
-                    path = args.output_dir
-                    start_name = 'checkpoint'
-                    current_step_num = global_step
-                    max_save_num = 2
-                    if args.global_rank == 0:
-                        print('removing')
-                        try:
-                            remove_earlier_ckpt(path, start_name, current_step_num, max_save_num)
-                        except:
-                            print('No ckpt to remove.')
-                else:
-                    stop += 1
-
-                if stop < args.num_ckpt:
-                    save_flag = True
-
-                if save_flag:
-                    output_dir_current = os.path.join(args.output_dir,
-                                                      "checkpoint-{}-epoch-{}-{}".format(global_step, current_epoch + 1,
-                                                                                         args.mark))
-                    client_sd = dict()
-
-                    save_model(model_engine, output_dir_current, client_state=client_sd)
-
-                reduce_loss_eval = 0
-                model_engine.train()
     print("Training loop finished.")
 
 

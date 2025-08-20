@@ -72,10 +72,12 @@ def process_ms_marco_json(json_path, output_dir):
     positives = []
     for qid, qtext in queries_data.items():
         for answer in answers_data.get(qid, []):
-            positives.append({
-                'sentence1': qtext,
-                'sentence2': answer
-            })
+            answer = answer.strip()
+            if answer:  # Skip empty answers
+                positives.append({
+                    'sentence1': qtext,
+                    'sentence2': answer
+                })
 
     # Save to TSV
     os.makedirs(output_dir, exist_ok=True)
@@ -87,6 +89,6 @@ def process_ms_marco_json(json_path, output_dir):
     create_qrels(data, output_dir)
 
 # Example usage:
-process_ms_marco_json('ms_marco/dev_v2.1.json', 'ms_marco/val')
-process_ms_marco_json('ms_marco/train_v2.1.json', 'ms_marco/train')
+# process_ms_marco_json('ms_marco/dev_v2.1.json', 'ms_marco/val')
+# process_ms_marco_json('ms_marco/train_v2.1.json', 'ms_marco/train')
 process_ms_marco_json('ms_marco/eval_v2.1_public.json', 'ms_marco/test')

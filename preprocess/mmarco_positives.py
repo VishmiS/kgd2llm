@@ -65,7 +65,7 @@ def process_mmarco_tsv(split_name, tsv_path, model):
 def main():
     mmarco_paths = {
         "train_path": "../dataset/ms_marco/train/positives.tsv",
-        "test_path": "../dataset/ms_marco/val/positives.tsv",
+        "val_path": "../dataset/ms_marco/val/positives.tsv",
     }
 
     model = SentenceTransformer(MODEL_NAME, device=DEVICE)
