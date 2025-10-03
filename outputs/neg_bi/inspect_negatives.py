@@ -64,5 +64,5 @@ def inspect_logits(file_path, label="", neg_K=8):
 
 if __name__ == "__main__":
     # Set your file paths here
-    neg_file = "train/query_hard_negatives.pkl"
+    neg_file = "val/query_hard_negatives.pkl"
     inspect_logits(neg_file, label="NEG", neg_K=8)

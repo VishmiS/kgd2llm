@@ -129,7 +129,7 @@ if __name__ == "__main__":
     output_inbatch_pkl_path = "../outputs/inbatch/mmarco_train_inbatch.pkl"
 
     task_type = "context"
-    batch_size = 32
+    batch_size = 16
     teacher_max_seq_length = 256
     num_shards = 1
     id_shard = 0

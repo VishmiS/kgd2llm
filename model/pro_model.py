@@ -156,10 +156,10 @@ class Mymodel(nn.Module):
         a_expand_emb = output_embeddings_a.unsqueeze(1).expand(-1, bs, -1).reshape(-1, self.emb_dim)
         b_expand_emb = output_embeddings_b.unsqueeze(0).expand(bs, -1, -1).reshape(-1, self.emb_dim)
 
-        task_expand = task_ids.unsqueeze(1).expand(-1, bs).reshape(-1, 1).squeeze()
+        task_expand = task_ids.unsqueeze(1).expand(-1, bs).reshape(-1)
         output_in_batch, _ = self.iem(a_expand_emb, b_expand_emb)  # (bs*bs, 2)
-        output_in_batch_specific_task = output_in_batch[range(task_expand.size(0)), task_expand].squeeze().reshape(bs,
-                                                                                                                   -1)
+        output_in_batch_specific_task = output_in_batch[torch.arange(task_expand.size(0)), task_expand]
+        output_in_batch_specific_task = output_in_batch_specific_task.reshape(bs, -1)
 
         if mode == 'train':
             pos_neg_emb = torch.cat([output_embeddings_b.unsqueeze(0), output_embeddings_hardneg], dim=0)

@@ -206,8 +206,8 @@ def main():
     },
     "gradient_accumulation_steps": args.gradient_accumulation_steps,
     "gradient_clipping": args.gradient_clipping,
-    "train_batch_size": args.world_size,
-    "train_micro_batch_size_per_gpu": 1,
+    "train_batch_size": args.batch_size * args.gradient_accumulation_steps * args.world_size,
+    "train_micro_batch_size_per_gpu": args.batch_size,
     "steps_per_print": 1e5
     }
 
@@ -349,30 +349,52 @@ def main():
             # print(f"[Debug] Expected reshape: ({micro_bs}, {args.neg_K}, 2) = {micro_bs * args.neg_K * 2}")
             # print(f"[Debug] Actual total elements: {logits_teacher_hardneg.numel()}")
 
-            logits_teacher_hardneg = logits_teacher_hardneg.reshape(micro_bs, args.neg_K, 2).to(args.device)
+            # Ensure logits_teacher_hardneg has shape [B, K, D]
+            logits_teacher_hardneg = logits_teacher_hardneg.reshape(micro_bs, args.neg_K, -1).to(args.device)
 
-            # print(f"logits_teacher_pos.shape: {logits_teacher_pos.shape}")  # Should be [micro_bs, 2]
+            # Ensure logits_teacher_pos has shape [B, 1, D] to match hardneg
+            logits_teacher_pos = logits_teacher_pos.to(args.device)
+            # Ensure logits_teacher_pos has shape [B, 1, D] to match hardneg
+            last_dim = logits_teacher_hardneg.size(-1)  # D
+            if logits_teacher_pos.dim() == 2:  # shape [B, D] or [B, 1]
+                logits_teacher_pos = logits_teacher_pos.unsqueeze(-1) if logits_teacher_pos.size(
+                    1) == 1 else logits_teacher_pos
+                logits_teacher_pos = logits_teacher_pos.expand(-1, 1, last_dim)  # [B, 1, D]
+
+            # Concatenate along dim=1 (negatives dimension)
+            logits_teacher_hardneg = torch.cat([logits_teacher_pos, logits_teacher_hardneg], dim=1)
+
+
+
+            print(f"logits_teacher_pos.shape: {logits_teacher_pos.shape}")  # Should be [micro_bs, 2]
             # print(f"Type: {type(logits_teacher_pos)}")
             # print(f"Min: {logits_teacher_pos.min()}, Max: {logits_teacher_pos.max()}")
             # print(f"logits_teacher_pos.unsqueeze(1).shape: {logits_teacher_pos.unsqueeze(1).shape}")  # Should be [micro_bs, 1, 2]
             # print(f"logits_teacher_hardneg.shape after reshape: {logits_teacher_hardneg.shape}")  # Should be [micro_bs, neg_K, 2]
-
-
-            logits_teacher_hardneg = torch.cat([logits_teacher_pos.unsqueeze(1), logits_teacher_hardneg], dim=1)
 
             loss_hardneg = cal_loss_hardneg(args, logits_teacher_hardneg, logits_student_hardneg,
                                             args.temperature_teacher_hardneg, args.temperature_hardneg, nll_criterion)
 
             loss_rd = cal_loss_rd(args, logits_teacher_hardneg, logits_student_hardneg, args.temperature_teacher_hardneg)
 
-            # print("[Debug] logits_teacher_hardneg shape:", logits_teacher_hardneg.shape)  # Expect [B, neg_K+1, 2]
+            print("[Debug] logits_teacher_hardneg shape:", logits_teacher_hardneg.shape)  # Expect [B, neg_K+1, 2]
             # print("[Debug] logits_teacher_inbatch shape:", logits_teacher_inbatch.shape)  # Expect [B, in_batch_neg]
             # print("[Debug] logits_student_hardneg shape:", logits_student_hardneg.shape)
             # print("[Debug] logits_student_in_batch shape:", logits_student_in_batch.shape)
 
             batch_size = logits_teacher_inbatch.shape[0]
             inbatch = logits_teacher_inbatch.shape[1] if logits_teacher_inbatch.dim() == 2 else 1
-            # print(f"[Debug] batch_size = {batch_size}, inbatch = {inbatch}")
+            print(f"[Debug] logits_teacher_inbatch batch_size = {batch_size}, inbatch = {inbatch}")
+
+            # Remove diagonal (self-positive) if needed
+            # B = logits_teacher_inbatch.size(0)  # actual batch size
+            # if logits_teacher_inbatch.size(1) == B:  # includes diagonal
+            #     mask = torch.ones_like(logits_teacher_inbatch, dtype=torch.bool)
+            #     mask[torch.arange(B), torch.arange(B)] = 0
+            #     logits_teacher_inbatch = logits_teacher_inbatch[mask].view(B, B - 1, -1)
+
+            print("[Debug] logits_teacher_inbatch.shape:", logits_teacher_inbatch.shape)
+            print("[Debug] micro_bs:", micro_bs)
 
             assert logits_teacher_inbatch.shape == (micro_bs, micro_bs - 1, 2)
 

@@ -175,15 +175,23 @@ def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
     print(f"  ▶️ Positive pickle file: {pos_dir}")
     print(f"  ▶️ Negative pickle file: {neg_dir}")
     print(f"  ▶️ Data file (TSV/JSONL): {file_path}\n")
+
     data = []
     pos_logits = load_pickle(pos_dir)
     hard_neg_house = load_pickle(neg_dir)
+
+    # Counters
+    total_records = 0
+    with_hard_negs = 0
+    with_pos_logits = 0
     missing_hard_neg_count = 0
     not_found_count = 0
 
     with open(file_path, encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
         for id, row in enumerate(reader):
+            total_records += 1
+
             text_a = row['sentence1']
             text_b = row['sentence2']
 
@@ -192,6 +200,7 @@ def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
             if not neg_list:
                 missing_hard_neg_count += 1
                 continue
+            with_hard_negs += 1
 
             if len(neg_list) < neg_K:
                 num = math.ceil(neg_K / len(neg_list))
@@ -203,39 +212,172 @@ def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
             hardnegs = [sample[:320] for sample in hardnegs]
             hardneg_logits = list(hardneg_logits)
 
-            # Lookup positive logit vector for this sample
+            # Lookup positive logit vector
             pos_logit_for_sample = pos_logits.get(text_a)
             if pos_logit_for_sample is None:
                 not_found_count += 1
-                # Assuming pos_logits are length 2 vectors, adjust if needed
                 pos_logit_for_sample = [0.0, 0.0]
+            else:
+                with_pos_logits += 1
 
-            data.append((text_a[:50], text_b[:320], pos_logit_for_sample, hardnegs, hardneg_logits, 1))
+            data.append((text_a[:50], text_b[:320], pos_logit_for_sample,
+                         hardnegs, hardneg_logits, 1))
 
-    if missing_hard_neg_count > 0:
-        print(f"⚠️ Total queries with NO hard negatives: {missing_hard_neg_count}")
-    print(f"📉 Pos logits not found for {not_found_count} samples.")
+    # Stats reporting
+    print("\n📊 Dataset Load Summary")
+    print(f"   • Total records in input file: {total_records}")
+    print(f"   • Records with hard negatives: {with_hard_negs}")
+    print(f"   • Records with NO hard negatives: {missing_hard_neg_count}")
+    print(f"   • Records with positive logits: {with_pos_logits}")
+    print(f"   • Records missing positive logits: {not_found_count}")
+    print(f"   • Final usable samples: {len(data)}\n")
 
     sample_num = len(data)
     res_data.extend(data)
 
     return res_data, sample_num
+
 
 
 def load_qa_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
     data = []
+    skipped_count = 0
+
+    with open(file_path, encoding='utf-8') as f:
+        reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
+
+        for id, row in enumerate(reader):
+            # Use .get to avoid KeyError if header mismatch
+            text_a = row.get('sentence1')
+            text_b = row.get('sentence2')
+
+            # Replace None with empty string
+            if text_a is None:
+                text_a = ""
+                skipped_count += 1
+            if text_b is None:
+                text_b = ""
+                skipped_count += 1
+
+            # Normalize the "No Answer Present." placeholder
+            if text_b.strip().lower() == "no answer present.":
+                text_b = ""
+
+            # Safe slicing even if text_a/text_b == ""
+            data.append((text_a[:50], text_b[:320], [], [], [], 1))
+
+    if skipped_count:
+        print(f"⚠️ {skipped_count} val samples had missing fields, replaced with empty string.")
+
+    sample_num = len(data)
+    res_data.extend(data)
+    return res_data, sample_num
+
+
+
+def load_mmarco_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
+    print(f"\n🔄 Loading dataset '{name}'")
+    print(f"  ▶️ Positive pickle file: {pos_dir}")
+    print(f"  ▶️ Negative pickle file: {neg_dir}")
+    print(f"  ▶️ Data file (TSV/JSONL): {file_path}\n")
+
+    data = []
+    pos_logits = load_pickle(pos_dir)
+    hard_neg_house = load_pickle(neg_dir)
+
+    # Counters
+    total_records = 0
+    with_hard_negs = 0
+    with_pos_logits = 0
+    missing_hard_neg_count = 0
+    not_found_count = 0
+
     with open(file_path, encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
         for id, row in enumerate(reader):
+            total_records += 1
+
             text_a = row['sentence1']
             text_b = row['sentence2']
-            data.append((text_a[:50], text_b[:320], [], [], [], 1))
+
+            # Check for hard negatives
+            neg_list = hard_neg_house.get(text_a, [])
+            if not neg_list:
+                missing_hard_neg_count += 1
+                continue
+            with_hard_negs += 1
+
+            if len(neg_list) < neg_K:
+                num = math.ceil(neg_K / len(neg_list))
+                negs_logits = random.sample(neg_list * num, neg_K)
+            else:
+                negs_logits = random.sample(neg_list, neg_K)
+
+            hardnegs, hardneg_logits = zip(*negs_logits)
+            hardnegs = [sample[:320] for sample in hardnegs]
+            hardneg_logits = list(hardneg_logits)
+
+            # Lookup positive logit vector (keys are (question, answer) tuples)
+            key = (text_a, text_b)
+            pos_logit_for_sample = pos_logits.get(key)
+            if pos_logit_for_sample is None:
+                not_found_count += 1
+                pos_logit_for_sample = [0.0, 0.0]
+            else:
+                with_pos_logits += 1
+
+            data.append((text_a[:50], text_b[:320], pos_logit_for_sample,
+                         hardnegs, hardneg_logits, 1))
+
+    # Stats reporting
+    print("\n📊 Dataset Load Summary")
+    print(f"   • Total records in input file: {total_records}")
+    print(f"   • Records with hard negatives: {with_hard_negs}")
+    print(f"   • Records with NO hard negatives: {missing_hard_neg_count}")
+    print(f"   • Records with positive logits: {with_pos_logits}")
+    print(f"   • Records missing positive logits: {not_found_count}")
+    print(f"   • Final usable samples: {len(data)}\n")
 
     sample_num = len(data)
     res_data.extend(data)
 
     return res_data, sample_num
 
+
+
+def load_mmarco_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
+    data = []
+    skipped_count = 0
+
+    with open(file_path, encoding='utf-8') as f:
+        reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
+
+        for id, row in enumerate(reader):
+            # Use .get to avoid KeyError if header mismatch
+            text_a = row.get('sentence1')
+            text_b = row.get('sentence2')
+
+            # Replace None with empty string
+            if text_a is None:
+                text_a = ""
+                skipped_count += 1
+            if text_b is None:
+                text_b = ""
+                skipped_count += 1
+
+            # Normalize the "No Answer Present." placeholder
+            if text_b.strip().lower() == "no answer present.":
+                text_b = ""
+
+            # Safe slicing even if text_a/text_b == ""
+            data.append((text_a[:50], text_b[:320], [], [], [], 1))
+
+    if skipped_count:
+        print(f"⚠️ {skipped_count} val samples had missing fields, replaced with empty string.")
+
+    sample_num = len(data)
+    res_data.extend(data)
+    return res_data, sample_num
 
 def collate_fn(data):
     res_s_a = []
@@ -316,7 +458,7 @@ class TrainDataset(Dataset):
             elif name in ['t2', 'du', 'mmarco', 'wq']:
                 if name == 'mmarco':
                     start_id = len(self.data)
-                    self.data, sample_num = load_qa_dataset_train(name, os.path.join(pos_dir, 'pos_emb/mmarco_train_pos_emb.pkl'),
+                    self.data, sample_num = load_mmarco_dataset_train(name, os.path.join(pos_dir, 'pos_emb/mmarco_train_pos_emb.pkl'),
                                                                       os.path.join(neg_dir, 'logits/mmarco_train_logits.pkl'),
                                                                       os.path.join(datadir, 'ms_marco/train/positives.tsv'), self.neg_K,
                                                                       self.data)
@@ -410,7 +552,7 @@ class ValDataset(Dataset):
 
                 if name == 'mmarco':
                     start_id = len(self.data)
-                    self.data, sample_num = load_qa_dataset_val(name, os.path.join(pos_dir, 'pos_emb/mmarco_val_pos_emb.pkl'),
+                    self.data, sample_num = load_mmarco_dataset_val(name, os.path.join(pos_dir, 'pos_emb/mmarco_val_pos_emb.pkl'),
                                                                     os.path.join(neg_dir, 'logits/mmarco_val_logits.pkl'),
                                                                     os.path.join(datadir, 'ms_marco/val/positives.tsv'), self.neg_K,
                                                                     self.data)

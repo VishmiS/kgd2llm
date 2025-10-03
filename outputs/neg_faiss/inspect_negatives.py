@@ -46,6 +46,7 @@ def inspect_logits(file_path, label="", neg_K=8):
 
         # Extra statistics for hard negatives
         lengths = [len(v) for v in logits.values()]
+        num_zero = sum(1 for l in lengths if l == 0)
         num_too_few = sum(1 for l in lengths if l < neg_K)
         num_enough = sum(1 for l in lengths if l >= neg_K)
 
@@ -54,6 +55,7 @@ def inspect_logits(file_path, label="", neg_K=8):
         print(f"  Min hard negatives per query: {min(lengths)}")
         print(f"  Max hard negatives per query: {max(lengths)}")
         print(f"  Average hard negatives per query: {sum(lengths) / len(lengths):.2f}")
+        print(f"  Queries with 0 hard negatives: {num_zero}")
         print(f"  Queries with < {neg_K} hard negatives: {num_too_few}")
         print(f"  Queries with ≥ {neg_K} hard negatives: {num_enough}")
 
@@ -64,5 +66,5 @@ def inspect_logits(file_path, label="", neg_K=8):
 
 if __name__ == "__main__":
     # Set your file paths here
-    neg_file = "snli_train_neg.pkl"
+    neg_file = "mmarco_train_neg.pkl"
     inspect_logits(neg_file, label="NEG", neg_K=8)

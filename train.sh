@@ -6,7 +6,8 @@ NEG_DIR="outputs"
 DATA_DIR="dataset"
 INBATCH_PKL_PATH_DIR="outputs/inbatch/mmarco_train_inbatch.pkl"
 FEATURE_PKL_PATH_DIR="outputs/features/mmarco_train_features.pkl"
-BATCH_SIZE=32
+BATCH_SIZE=16
+GRAD_ACCUM=32
 NEG_K=8
 NUM_HEADS=32
 HIDDEN_DIM=512
@@ -48,6 +49,7 @@ python -m torch.distributed.run --nproc_per_node=$gpus --nnode=$WORLD_SIZE --nod
                                 --inbatch_pkl_path_dir $INBATCH_PKL_PATH_DIR \
                                 --feature_pkl_path_dir $FEATURE_PKL_PATH_DIR \
                                 --batch_size $BATCH_SIZE \
+                                --gradient_accumulation_steps $GRAD_ACCUM \
                                 --neg_K $NEG_K \
                                 --num_heads $NUM_HEADS \
                                 --hidden_dim $HIDDEN_DIM \

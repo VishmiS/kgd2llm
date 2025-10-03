@@ -1,6 +1,8 @@
 import csv
 import os
 import json
+from tqdm import tqdm
+
 
 def save_tsv(data, path, fieldnames):
     with open(path, 'w', encoding='utf-8', newline='') as f:
@@ -10,42 +12,33 @@ def save_tsv(data, path, fieldnames):
             writer.writerow(row)
     print(f"Saved: {path}")
 
-def create_qrels(data, output_dir):
-    passages_data = data.get('passages', {})
-    answers_data = data.get('answers', {})
 
-    # Build a reverse map: passage_text -> list of passage_id(s)
-    text_to_pid = {}
-    for pid, plist in passages_data.items():
-        for p in plist:
-            text = p.get('passage_text', '').strip()
-            if text:
-                if text not in text_to_pid:
-                    text_to_pid[text] = []
-                text_to_pid[text].append(pid)
+def create_qrels_from_json(passages_data, output_dir):
+    """
+    Generate qrels directly from passages (using is_selected field).
+    Format: query_id, 0, passage_id, rel
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    qrels_path = os.path.join(output_dir, 'qrels.tsv')
 
-    qrels = []
-    for qid, answers in answers_data.items():
-        for ans in answers:
-            ans = ans.strip()
-            if ans in text_to_pid:
-                for pid in text_to_pid[ans]:
-                    qrels.append({
+    with open(qrels_path, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(
+            f, fieldnames=['query_id', 'zero', 'passage_id', 'rel'], delimiter='\t'
+        )
+        writer.writeheader()
+
+        for qid, plist in tqdm(passages_data.items(), desc="Building qrels"):
+            for idx, p in enumerate(plist):
+                if p.get("is_selected", 0) == 1:  # positive passage
+                    writer.writerow({
                         'query_id': qid,
                         'zero': 0,
-                        'passage_id': pid,
+                        'passage_id': f"{qid}_{idx}",  # unique passage id
                         'rel': 1
                     })
 
-    # Save qrels file
-    os.makedirs(output_dir, exist_ok=True)
-    qrels_path = os.path.join(output_dir, 'qrels.tsv')
-    with open(qrels_path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['query_id', 'zero', 'passage_id', 'rel'], delimiter='\t')
-        writer.writeheader()
-        for row in qrels:
-            writer.writerow(row)
     print(f"Saved qrels file at: {qrels_path}")
+
 
 def process_ms_marco_json(json_path, output_dir):
     print(f"\nProcessing: {json_path}")
@@ -54,41 +47,50 @@ def process_ms_marco_json(json_path, output_dir):
 
     passages_data = data.get('passages', {})
     queries_data = data.get('query', {})
-    answers_data = data.get('answers', {})
 
     # Corpus TSV: ['id', 'text']
     corpus = []
-    for pid, plist in passages_data.items():
-        for p in plist:
+    for qid, plist in tqdm(passages_data.items(), desc="Building corpus"):
+        for idx, p in enumerate(plist):
             corpus.append({
-                'id': pid,
+                'id': f"{qid}_{idx}",  # unique passage id
                 'text': p.get('passage_text', '')
             })
 
     # Queries TSV: ['id', 'query']
-    queries = [{'id': qid, 'query': qtext} for qid, qtext in queries_data.items()]
+    queries = [
+        {'id': qid, 'query': qtext}
+        for qid, qtext in tqdm(queries_data.items(), desc="Building queries")
+    ]
 
-    # Positives TSV: ['sentence1', 'sentence2']
+    # Positives TSV: ['sentence1', 'sentence2', 'query_id', 'passage_id']
     positives = []
-    for qid, qtext in queries_data.items():
-        for answer in answers_data.get(qid, []):
-            answer = answer.strip()
-            if answer:  # Skip empty answers
+    for qid, plist in tqdm(passages_data.items(), desc="Building positives"):
+        qtext = queries_data.get(qid, "")
+        for idx, p in enumerate(plist):
+            if p.get("is_selected", 0) == 1:  # relevant passage
                 positives.append({
                     'sentence1': qtext,
-                    'sentence2': answer
+                    'sentence2': p.get('passage_text', ''),
+                    'query_id': qid,
+                    'passage_id': f"{qid}_{idx}"
                 })
 
     # Save to TSV
     os.makedirs(output_dir, exist_ok=True)
     save_tsv(corpus, os.path.join(output_dir, 'corpus.tsv'), ['id', 'text'])
     save_tsv(queries, os.path.join(output_dir, 'queries.tsv'), ['id', 'query'])
-    save_tsv(positives, os.path.join(output_dir, 'positives.tsv'), ['sentence1', 'sentence2'])
+    save_tsv(
+        positives,
+        os.path.join(output_dir, 'positives.tsv'),
+        ['sentence1', 'sentence2', 'query_id', 'passage_id']
+    )
 
-    # Create qrels file for both val and train sets
-    create_qrels(data, output_dir)
+    # Create qrels file from JSON directly
+    create_qrels_from_json(passages_data, output_dir)
+
 
 # Example usage:
-# process_ms_marco_json('ms_marco/dev_v2.1.json', 'ms_marco/val')
-# process_ms_marco_json('ms_marco/train_v2.1.json', 'ms_marco/train')
+process_ms_marco_json('ms_marco/dev_v2.1.json', 'ms_marco/val')
+process_ms_marco_json('ms_marco/train_v2.1.json', 'ms_marco/train')
 process_ms_marco_json('ms_marco/eval_v2.1_public.json', 'ms_marco/test')
