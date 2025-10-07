@@ -11,6 +11,8 @@ from argparse import Namespace
 from collections import defaultdict
 from model.pro_model import Mymodel
 from tqdm import tqdm
+import hashlib
+import random, numpy as np, torch
 
 # Paths
 MODEL_PATH = "/root/pycharm_semanticsearch/PATH_TO_OUTPUT_MODEL/mmarco/final_student_model_fp32"
@@ -19,7 +21,7 @@ CORPUS_FILE  = "/root/pycharm_semanticsearch/dataset/ms_marco/val/corpus.tsv"
 QRELS_FILE   = "/root/pycharm_semanticsearch/dataset/ms_marco/val/qrels.tsv"
 
 # Settings
-MAX_QUERIES = 20      # process all queries
+MAX_QUERIES = 30      # process all queries
 MAX_CORPUS_DOCS = 1000   # process all corpus documents
 RECALL_K = 10
 BATCH_SIZE = 16
@@ -75,15 +77,39 @@ def load_qrels():
     return qrels
 
 
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-def encode_corpus(model, corpus, batch_size=BATCH_SIZE):
+def compute_hash(model_path, corpus_file, max_docs, batch_size):
+    """Generate a unique cache hash based on key parameters."""
+    info = f"{model_path}-{corpus_file}-{max_docs}-{batch_size}"
+    return hashlib.md5(info.encode()).hexdigest()
+
+def encode_corpus(model, corpus, batch_size=BATCH_SIZE, force_rebuild=False):
     """
     Encode corpus embeddings and save to disk for reuse.
+    Automatically rebuilds if cache is stale or invalid.
     """
-    if os.path.exists(CORPUS_EMB_FILE):
-        data = torch.load(CORPUS_EMB_FILE)
+    cache_hash = compute_hash(MODEL_PATH, CORPUS_FILE, len(corpus), batch_size)
+    cache_file = f"corpus_embs_{cache_hash}.pt"
+
+    # Optionally remove outdated default cache file
+    if force_rebuild and os.path.exists(cache_file):
+        print("[INFO] Rebuilding corpus embeddings (forced)...")
+        os.remove(cache_file)
+
+    # Load cache if it matches
+    if os.path.exists(cache_file) and not force_rebuild:
+        print(f"[INFO] Using cached embeddings: {cache_file}")
+        data = torch.load(cache_file)
         return data["ids"], data["embs"].to(device)
 
+    print("[INFO] Encoding corpus from scratch...")
     corpus_ids = list(corpus.keys())
     corpus_texts = [corpus[cid] for cid in corpus_ids]
     corpus_embs_list = []
@@ -95,7 +121,8 @@ def encode_corpus(model, corpus, batch_size=BATCH_SIZE):
             corpus_embs_list.append(batch_embs)
 
     corpus_embs = torch.cat(corpus_embs_list, dim=0)
-    torch.save({"ids": corpus_ids, "embs": corpus_embs.cpu()}, CORPUS_EMB_FILE)
+    torch.save({"ids": corpus_ids, "embs": corpus_embs.cpu()}, cache_file)
+    print(f"[INFO] Saved new cache: {cache_file}")
     return corpus_ids, corpus_embs
 
 
@@ -104,16 +131,18 @@ def evaluate_mmarco():
     for f in [QUERIES_FILE, CORPUS_FILE, QRELS_FILE, MODEL_PATH]:
         assert os.path.exists(f), f"{f} not found"
 
+    set_seed(42)
+    print("[INFO] Random seed fixed to 42 for reproducibility.")
+
     queries = load_queries(MAX_QUERIES)
     corpus = load_corpus(MAX_CORPUS_DOCS)
-
     qrels = load_qrels()
 
     model = Mymodel(model_name_or_path=MODEL_PATH, args=args)
     model.eval().to(device)
 
     # Encode corpus embeddings
-    corpus_ids, corpus_embs = encode_corpus(model, corpus)
+    corpus_ids, corpus_embs = encode_corpus(model, corpus, force_rebuild=False)
 
     # FAISS CPU index (IP = inner product) with L2-normalized embeddings
     corpus_embs_np = corpus_embs.cpu().numpy().astype('float32')
