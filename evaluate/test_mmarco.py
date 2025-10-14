@@ -21,8 +21,8 @@ CORPUS_FILE  = "/root/pycharm_semanticsearch/dataset/ms_marco/val/corpus.tsv"
 QRELS_FILE   = "/root/pycharm_semanticsearch/dataset/ms_marco/val/qrels.tsv"
 
 # Settings
-MAX_QUERIES = 30      # process all queries
-MAX_CORPUS_DOCS = 1000   # process all corpus documents
+MAX_QUERIES = 59273      # process all queries
+MAX_CORPUS_DOCS = 1008986   # process all corpus documents
 RECALL_K = 10
 BATCH_SIZE = 16
 CORPUS_EMB_FILE = "corpus_embs.pt"
