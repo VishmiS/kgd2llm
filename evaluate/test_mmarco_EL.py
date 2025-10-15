@@ -1,9 +1,8 @@
 # conda activate faiss-gpu-py38
 # python /root/pycharm_semanticsearch/evaluate/test_mmarco_EL.py
 
-import sys
-import os
-import ast
+
+import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import torch
 import faiss
@@ -11,7 +10,7 @@ from argparse import Namespace
 from collections import defaultdict
 from model.pro_model import Mymodel
 from tqdm import tqdm
-from entity_linking import enrich_query_with_aliases_and_facts
+from entity_linking.pipeline import enrich_query_with_entities_and_facts, print_clean_pipeline_result
 import pickle
 import time
 import hashlib
@@ -20,6 +19,7 @@ import pandas as pd
 from langdetect import detect
 import re
 
+
 # Paths
 MODEL_PATH = "/root/pycharm_semanticsearch/PATH_TO_OUTPUT_MODEL/mmarco/final_student_model_fp32"
 QUERIES_FILE = "/root/pycharm_semanticsearch/dataset/ms_marco/val/queries.tsv"
@@ -27,8 +27,8 @@ CORPUS_FILE  = "/root/pycharm_semanticsearch/dataset/ms_marco/val/corpus.tsv"
 QRELS_FILE   = "/root/pycharm_semanticsearch/dataset/ms_marco/val/qrels.tsv"
 
 # Settings
-MAX_QUERIES = 30      # process all queries
-MAX_CORPUS_DOCS = 1000 # limit corpus documents for testing
+MAX_QUERIES = 59273 # 59273       process all queries
+MAX_CORPUS_DOCS = 1008986 # 1008986     limit corpus documents for testing
 RECALL_K = 10
 BATCH_SIZE = 16
 CORPUS_EMB_FILE = "corpus_embs_EL.pt"
@@ -138,6 +138,26 @@ def encode_corpus(model, corpus, batch_size=BATCH_SIZE, force_rebuild=False):
     return corpus_ids, torch.from_numpy(corpus_embs_np).to(device)
 
 
+def summarize_relation_mapping(relation_mapping, falcon_relations, falcon_qids):
+    if not relation_mapping:
+        return "(none)"
+    summaries = []
+    for rid, ents in relation_mapping.items():
+        rel_label = falcon_relations.get(rid, rid)
+        parts = []
+        for e in ents:
+            # Handle both dict-based and legacy string-based structures
+            if isinstance(e, dict):
+                src = falcon_qids.get(e.get("source"), e.get("source"))
+                tgt = falcon_qids.get(e.get("target"), e.get("value", e.get("target")))
+                parts.append(f"{src} → {tgt}")
+            elif isinstance(e, str):
+                parts.append(falcon_qids.get(e, e))
+            else:
+                parts.append(str(e))
+        summaries.append(f"{rel_label} → {', '.join(parts)}")
+    return "; ".join(summaries)
+
 
 def evaluate_mmarco():
     # Sanity checks
@@ -155,7 +175,7 @@ def evaluate_mmarco():
     model.eval().to(device)
 
     # Encode corpus embeddings
-    corpus_ids, corpus_embs = encode_corpus(model, corpus, force_rebuild=True)
+    corpus_ids, corpus_embs = encode_corpus(model, corpus, force_rebuild=False)
 
     # FAISS CPU index (IP = inner product) with L2-normalized embeddings
     corpus_embs_np = corpus_embs.cpu().numpy().astype('float32')
@@ -171,13 +191,11 @@ def evaluate_mmarco():
     ENRICHED_QUERIES_CACHE = "enriched_queries.pkl"
     ENRICHED_RECORDS_CACHE = "enriched_records.pkl"
 
-    if os.path.exists(ENRICHED_QUERIES_CACHE) and os.path.exists(ENRICHED_RECORDS_CACHE):
-        # Load both query_texts and enriched_records from cache
-        with open(ENRICHED_QUERIES_CACHE, "rb") as f:
-            query_texts = pickle.load(f)
-        with open(ENRICHED_RECORDS_CACHE, "rb") as f:
-            enriched_records = pickle.load(f)
-    else:
+    force_rebuild_enrichment = True
+
+    if force_rebuild_enrichment or not (
+            os.path.exists(ENRICHED_QUERIES_CACHE) and os.path.exists(ENRICHED_RECORDS_CACHE)):
+
         query_texts = []
         enriched_records = []
 
@@ -191,18 +209,50 @@ def evaluate_mmarco():
                 pass  # language detection can fail for short or non-text queries
 
             # ✅ Always enrich query regardless of language
-            enriched_result = enrich_query_with_aliases_and_facts(query_text_original)
+            enriched_result = enrich_query_with_entities_and_facts(query_text_original)
 
-            query_text = enriched_result.get("reformulated_query", "").strip()
-            query_text = re.sub(r"^[\.\s]+", "", query_text)  # clean leading dots/spaces
-            query_text = re.sub(r"\s+", " ", query_text)  # normalize whitespace
+            # print(f"Query: {query_text_original}")
+            # print("Detected entities:", enriched_result.get("falcon_qids"))
+            # print("Wikidata facts (raw):", enriched_result.get("wikidata_facts"))
+            # print("Wikidata facts filtered:", enriched_result.get("wikidata_facts_filtered"))
+            # print("DBpedia facts (raw):", enriched_result.get("dbpedia_facts_raw"))
+            # print("DBpedia facts filtered:", enriched_result.get("dbpedia_facts_filtered"))
+
+            # Extract fact sets from both sources
+            wikidata_facts_filtered = enriched_result.get("wikidata_facts_filtered", {})
+            dbpedia_facts_filtered = enriched_result.get("dbpedia_facts_filtered", {})
+
+            # Determine if any *additional facts* are actually found
+            has_additional_facts = bool(wikidata_facts_filtered or dbpedia_facts_filtered)
+
+            # Reformulate only if additional facts exist
+            if has_additional_facts:
+                # Use the final reformulated text from pipeline summary if present
+                query_text = (
+                        enriched_result.get("reformulated_query")
+                        or enriched_result.get("natural_language_summary")
+                        or query_text_original
+                ).strip()
+            else:
+                query_text = query_text_original.strip()
+
+            # Clean up whitespace and punctuation
+            query_text = re.sub(r"[\s]+", " ", query_text)
+            query_text = re.sub(r"^[\.\s]+", "", query_text)
+
+            # Clean up whitespace, periods, question marks, and underscores
+            # query_text = re.sub(r"^[\.\s?_]+", "", query_text)  # Remove from start
+            # query_text = re.sub(r"[\s?_]+", " ", query_text)  # Replace sequences with a single space
+
+            # Track whether reformulated
+            reformulated_flag = "Yes" if query_text != query_text_original else "No"
             query_texts.append(query_text)
 
-            reformulated_flag = "Yes" if query_text != query_text_original else "No"
-
             all_entities = enriched_result.get("falcon_qids", {})
-            wikidata_entities = enriched_result.get("wikidata_aliases", {})
-            dbpedia_entities = enriched_result.get("dbpedia_aliases", {})
+            wikidata_entities = enriched_result.get("wikidata_entities", {})
+            wikidata_facts_filtered = enriched_result.get("wikidata_facts_filtered", {})
+            dbpedia_entities = enriched_result.get("dbpedia_entities", {})
+            dbpedia_facts_filtered = enriched_result.get("dbpedia_facts_filtered", {})
 
             # Entity complexity classification
             entity_complexity = {
@@ -210,6 +260,30 @@ def evaluate_mmarco():
             }
             count_simple_entities = sum(v == "simple" for v in entity_complexity.values())
             count_complex_entities = sum(v == "complex" for v in entity_complexity.values())
+
+            wikidata_facts_raw = (
+                    enriched_result.get("wikidata_facts_filtered")
+                    or enriched_result.get("wikidata_facts")
+                    or {}
+            )
+
+            dbpedia_facts_raw = (
+                    enriched_result.get("dbpedia_facts_filtered")
+                    or enriched_result.get("dbpedia_facts_raw")
+                    or {}
+            )
+
+            additional_info = []
+
+            # --- Wikidata raw facts ---
+            for facts in wikidata_facts_raw.values():
+                for prop, val in facts:
+                    additional_info.append(f"[Wikidata] {prop}: {val}")
+
+            # --- DBpedia raw facts ---
+            for facts in dbpedia_facts_raw.values():
+                for prop, val in facts:
+                    additional_info.append(f"[DBpedia] {prop}: {val}")
 
             enriched_records.append({
                 "query_id": qid,
@@ -228,26 +302,265 @@ def evaluate_mmarco():
                 "count_entities": len(all_entities),
                 "count_simple_entities": count_simple_entities,
                 "count_complex_entities": count_complex_entities,
+
+                # ✅ add this line
+                "dbpedia_entities": dbpedia_entities,
+
                 "entities_source": {
-                    "wikidata": list(wikidata_entities.keys()),
-                    "dbpedia": list(dbpedia_entities.keys())
+                    "wikidata_names": list(all_entities.values()),
+                    "wikidata_qids": list(all_entities.keys()),
+                    "dbpedia_names": list(dbpedia_entities.values()),
+                    "dbpedia_urls": list(dbpedia_entities.keys())
                 },
-                "additional_info": {
-                    "aliases": [alias for aliases in wikidata_entities.values() for alias in aliases],
-                    "facts": [
-                        fact for facts in enriched_result.get("wikidata_facts_filtered", {}).values()
-                        for fact in facts
-                    ]
-                }
+                "wikidata_facts_filtered": wikidata_facts_filtered,
+                "wikidata_facts_raw": enriched_result.get("wikidata_facts", {}),
+                "dbpedia_facts_filtered": dbpedia_facts_filtered,
+                "dbpedia_facts_raw": enriched_result.get("dbpedia_facts_raw", {}),
+                "additional_info": additional_info,
+
+                "entity_types": enriched_result.get("entity_types", {}),
+                "relation_entity_mapping": enriched_result.get("relation_entity_mapping", {}),
+                "falcon_relations": enriched_result.get("falcon_relations", {}),
+                "falcon_qids": enriched_result.get("falcon_qids", {}),
+
             })
 
-            time.sleep(5) # if you want the pause
-        with open(ENRICHED_QUERIES_CACHE, "wb") as f:
-            pickle.dump(query_texts, f)
+            time.sleep(1) # if you want the pause
+    else:
+        # Load from cache
+        with open(ENRICHED_QUERIES_CACHE, "rb") as f:
+            query_texts = pickle.load(f)
+        with open(ENRICHED_RECORDS_CACHE, "rb") as f:
+            enriched_records = pickle.load(f)
 
-    df = pd.DataFrame(enriched_records)
-    df.to_excel("entity_linking_results.xlsx", index=False)
-    print("[INFO] Entity linking results saved to entity_linking_results.xlsx")
+    query_rows = []
+    entity_rows = []
+
+    for rec in enriched_records:
+        # Query-level info
+        query_rows.append({
+            "query_id": rec["query_id"],
+            "original_query": rec["original_query"],
+            "reformulated_query": rec["reformulated_query"],
+            "was_reformulated": rec["was_reformulated"],
+            "query_language": rec["query_language"],
+            "query_complexity": rec["query_complexity"],
+            "count_entities": rec["count_entities"],
+            "count_simple_entities": rec["count_simple_entities"],
+            "count_complex_entities": rec["count_complex_entities"],
+        })
+
+        enriched = rec.get("enriched", rec)  # alias for clarity
+        #
+        # # 🟩 ADD THESE DEBUG PRINTS
+        # print("\n==== DEBUG: Enriched Record ====")
+        # print("Keys:", enriched.keys())
+        # print("falcon_relations field:", enriched.get("falcon_relations"))
+        # print("relation_entity_mapping field:", enriched.get("relation_entity_mapping"))
+        # print("==============================\n")
+
+        # ---------------- RELATION + FACT SUMMARIES ----------------
+        falcon_relations = enriched.get("falcon_relations", {})
+        relation_mapping = enriched.get("relation_entity_mapping", {})
+
+        # ---------------- RELATION + FACT SUMMARIES ----------------
+        falcon_relations = enriched.get("falcon_relations", {})
+        relation_mapping = enriched.get("relation_entity_mapping", {})
+        falcon_qids = enriched.get("falcon_qids", {})
+
+        # Identify relations by their *label*
+        identified_relations = ", ".join(
+            sorted(set(v for v in falcon_relations.values() if isinstance(v, str)))
+        ) if falcon_relations else "(none)"
+
+        # Build readable relation→entity summary
+        relation_pairs = []
+        for rel, ents in relation_mapping.items():
+            rel_label = falcon_relations.get(rel, rel)
+            if isinstance(ents, list):
+                for e in ents:
+                    if isinstance(e, dict):
+                        src = e.get("source")
+                        tgt = e.get("target") or e.get("value")
+                        src_label = falcon_qids.get(src, src)
+                        tgt_label = falcon_qids.get(tgt, tgt)
+                        relation_pairs.append(f"{rel_label}: {src_label} → {tgt_label}")
+                    else:
+                        readable_ent = falcon_qids.get(e, e)
+                        relation_pairs.append(f"{rel_label} → {readable_ent}")
+            elif isinstance(ents, str):
+                readable_ent = falcon_qids.get(ents, ents)
+                relation_pairs.append(f"{rel_label} → {readable_ent}")
+            elif isinstance(ents, dict):
+                src = ents.get("source")
+                tgt = ents.get("target") or ents.get("value")
+                src_label = falcon_qids.get(src, src)
+                tgt_label = falcon_qids.get(tgt, tgt)
+                relation_pairs.append(f"{rel_label}: {src_label} → {tgt_label}")
+
+        relation_mapping_summary = "; ".join(relation_pairs) if relation_pairs else "(none)"
+
+        def summarize_facts(facts_dict):
+            all_pairs = []
+            for eid, facts in facts_dict.items():
+                for f in facts:
+                    if isinstance(f, dict):
+                        all_pairs.append(f"{f.get('property')}: {f.get('value')}")
+                    else:
+                        try:
+                            p, v = f
+                            all_pairs.append(f"{p}: {v}")
+                        except Exception:
+                            continue
+            return "; ".join(all_pairs[:5]) if all_pairs else "(none)"
+
+        wikidata_facts_summary = summarize_facts(enriched.get("wikidata_facts_filtered", {}))
+        dbpedia_facts_summary = summarize_facts(enriched.get("dbpedia_facts_filtered", {}))
+
+        query_rows[-1].update({
+            "identified_relations": identified_relations,
+            "relation_mapping_summary": relation_mapping_summary,
+            "wikidata_facts_summary": wikidata_facts_summary,
+            "dbpedia_facts_summary": dbpedia_facts_summary,
+        })
+
+        # ---------------- ENTITY-LEVEL DETAILS ----------------
+        all_entities = enriched.get("all_entities", [])
+        entity_qids = enriched.get("entity_qids", [])
+        complexity_map = enriched.get("entity_complexity", {})
+
+        entity_types_dict = enriched.get("entity_types", {})
+        relation_entity_mapping = enriched.get("relation_entity_mapping", {})
+
+        # Try to get entity descriptions (from Wikidata labels)
+        entity_descriptions_dict = {}
+        if "wikidata_entities" in enriched:
+            for qid, forms in enriched["wikidata_entities"].items():
+                if isinstance(forms, list) and forms:
+                    entity_descriptions_dict[qid] = forms[0]
+                else:
+                    entity_descriptions_dict[qid] = "(none)"
+
+        for i, entity_name in enumerate(all_entities):
+            entity_qid = entity_qids[i] if i < len(entity_qids) else None
+            complexity = complexity_map.get(entity_qid, "unknown")
+
+            # --- Wikidata facts ---
+            wikidata_facts_filtered = enriched.get("wikidata_facts_filtered", {}).get(entity_qid, [])
+            wikidata_facts_raw = enriched.get("wikidata_facts_raw", {}).get(entity_qid, [])
+
+            def join_facts(facts):
+                pairs = []
+                for f in facts:
+                    if isinstance(f, dict):
+                        pairs.append(f"{f.get('property')}: {f.get('value')}")
+                    else:
+                        try:
+                            p, v = f
+                            pairs.append(f"{p}: {v}")
+                        except Exception:
+                            continue
+                return "; ".join(pairs) if pairs else "(none)"
+
+            wikidata_facts_filtered_str = join_facts(wikidata_facts_filtered)
+            wikidata_facts_raw_str = join_facts(wikidata_facts_raw)
+
+            # --- Entity types ---
+            entity_types_list = entity_types_dict.get(entity_qid, [])
+            entity_type_str = ", ".join(entity_types_list) if entity_types_list else "(unknown)"
+
+
+            # --- Relations (relation names + linked entities) ---
+            relations_for_entity = []
+
+            falcon_relations = enriched.get("falcon_relations", {})
+            falcon_qids = enriched.get("falcon_qids", {})
+            relation_entity_mapping = enriched.get("relation_entity_mapping", {})
+
+            for rel, ents in relation_entity_mapping.items():
+                readable_rel = falcon_relations.get(rel, rel)  # e.g. P50 → write
+                for e in ents:
+                    if isinstance(e, dict):
+                        # Handle modern relation structure
+                        src = e.get("source")
+                        tgt = e.get("target") or e.get("value")
+                        src_label = falcon_qids.get(src, src)
+                        tgt_label = falcon_qids.get(tgt, tgt)
+                        if src == entity_qid or src_label.lower() == entity_name.lower():
+                            relations_for_entity.append(f"{readable_rel}: {tgt_label}")
+                        elif tgt == entity_qid or tgt_label.lower() == entity_name.lower():
+                            relations_for_entity.append(f"{readable_rel}: {src_label}")
+                    elif isinstance(e, str):
+                        readable_ent = falcon_qids.get(e, e)
+                        relations_for_entity.append(f"{readable_rel}: {readable_ent}")
+                    else:
+                        relations_for_entity.append(f"{readable_rel}: {str(e)}")
+
+            relations_str = "; ".join(relations_for_entity) if relations_for_entity else "(none)"
+
+            # For your identified_relations column:
+            identified_relations = (
+                ", ".join(sorted(set(falcon_relations.get(r, r) for r in relation_entity_mapping.keys())))
+                if relation_entity_mapping else "(none)"
+            )
+
+            # --- URL ---
+            entity_url = (
+                f"https://www.wikidata.org/wiki/{entity_qid}"
+                if entity_qid and entity_qid.startswith("Q")
+                else "(unknown)"
+            )
+
+            # ---- Wikidata row ----
+            entity_rows.append({
+                "query_id": rec["query_id"],
+                "entity_label": entity_name,
+                "entity_qid": entity_qid,
+                "entity_url": entity_url,
+                "source": "Wikidata",
+                "complexity": complexity,
+                "entity_types": entity_type_str,
+                "relations": relations_str,
+                "raw_facts": wikidata_facts_raw_str,
+                "filtered_facts": wikidata_facts_filtered_str
+            })
+
+            # ---- DBpedia row ----
+            dbpedia_uri = None
+            for uri, name in enriched.get("dbpedia_entities", {}).items():
+                if name.lower() == entity_name.lower():
+                    dbpedia_uri = uri
+                    break
+
+            dbpedia_facts_filtered = enriched.get("dbpedia_facts_filtered", {}).get(dbpedia_uri, [])
+            dbpedia_facts_raw = enriched.get("dbpedia_facts_raw", {}).get(dbpedia_uri, [])
+
+            dbpedia_facts_filtered_str = join_facts(dbpedia_facts_filtered)
+            dbpedia_facts_raw_str = join_facts(dbpedia_facts_raw)
+
+            entity_rows.append({
+                "query_id": rec["query_id"],
+                "entity_label": entity_name,
+                "entity_qid": entity_qid,
+                "entity_url": dbpedia_uri or "(unknown)",
+                "source": "DBpedia",
+                "complexity": complexity,
+                "entity_types": "(unknown)",
+                "relations": relations_str,
+                "raw_facts": dbpedia_facts_raw_str,
+                "filtered_facts": dbpedia_facts_filtered_str
+            })
+
+    # --- Save both sheets into one Excel file ---
+    queries_df = pd.DataFrame(query_rows)
+    entities_df = pd.DataFrame(entity_rows)
+
+    output_path = "entity_linking_results.xlsx"
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        queries_df.to_excel(writer, index=False, sheet_name="queries")
+        entities_df.to_excel(writer, index=False, sheet_name="entities")
+
+    print(f"[INFO] Saved results to {output_path} with 'queries' and 'entities' sheets.")
 
     with torch.no_grad():
         printed_examples = 0  # counter for printed samples
@@ -296,6 +609,21 @@ def evaluate_mmarco():
     print(f"Avg MRR       : {avg_mrr:.4f}")
     print(f"Recall@{RECALL_K}: {avg_recall:.2%}")
 
+    # ✅ Save results to text file
+    results_file = "evaluation_results.txt"
+    with open(results_file, "w") as f:
+        f.write("==== Evaluation Summary ====\n")
+        f.write(f"Total queries evaluated: {num_eval}\n")
+        f.write(f"Average MRR: {avg_mrr:.4f}\n")
+        f.write(f"Recall@{RECALL_K}: {avg_recall:.2%}\n")
+        f.write("\n==== Per-query Results (first 50 shown) ====\n")
+
+        # Optionally, log per-query MRR values if you track them
+        # You can add a list to store per-query metrics inside the loop above
+        # For now, we'll just store the last 50 printed ones
+        f.write("(Add per-query details here if needed)\n")
+
+    print(f"[INFO] Results saved to {results_file}")
 
 if __name__ == "__main__":
     evaluate_mmarco()
