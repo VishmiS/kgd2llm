@@ -2,7 +2,7 @@ import requests
 from sentence_transformers import SentenceTransformer, util
 import time
 import re
-
+import json
 from SPARQLWrapper import SPARQLWrapper, JSON
 # Load SentenceTransformer model for semantic similarity
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -616,21 +616,83 @@ def get_entity_facts(qid, property_filter=None, limit=50):
 
     return facts
 
+def run_sparql_query(query, endpoint="https://query.wikidata.org/sparql"):
+    """
+    Executes a SPARQL query against Wikidata and returns JSON results as a list of dicts.
+    Handles rate limits (429) gracefully.
+    """
+    headers = {
+        "Accept": "application/sparql-results+json",
+        "User-Agent": "EntityLinkingPipeline/1.0 (https://example.org)"
+    }
+    try:
+        response = requests.get(endpoint, params={"query": query}, headers=headers, timeout=30)
+        if response.status_code == 429:
+            print("[SPARQL] Rate limit hit (429) — retrying after delay...")
+            import time; time.sleep(5)
+            response = requests.get(endpoint, params={"query": query}, headers=headers, timeout=30)
+
+        response.raise_for_status()
+        data = response.json()
+        results = []
+        for b in data.get("results", {}).get("bindings", []):
+            row = {}
+            for k, v in b.items():
+                row[k] = v.get("value", "")
+            results.append(row)
+        return results
+
+    except Exception as e:
+        print(f"[SPARQL ERROR] {e}")
+        return []
+
+
 def enrich_query_with_entities_and_facts(original_text):
     # ------------------- Entity Linking -------------------
-    falcon_qids, falcon_dbpedia = {}, {}
+    falcon_qids = {}
+    falcon_dbpedia_entities = {}
+
     qids, dbs, qrels, db_rels = falcon_entity_linking(original_text)
-    falcon_qids.update(qids)
-    falcon_dbpedia.update(dbs)
 
-    # Merge all relation dictionaries
-    falcon_relations = {**qrels, **db_rels}
+    if qids:
+        falcon_qids.update(qids)
+    if dbs:
+        falcon_dbpedia_entities.update(dbs)
 
+    # --- Robust relation extraction ---
+    falcon_relations = {}
+
+    def clean_relations(rel_dict):
+        clean_map = {}
+        if isinstance(rel_dict, dict):
+            for k, v in rel_dict.items():
+                if not k or not v:
+                    continue
+                # Only accept keys that look like relation IDs or URLs
+                if isinstance(k, str) and (k.startswith("P") or "ontology" in k or "property" in k):
+                    if isinstance(v, str) and len(v.strip()) > 2:
+                        clean_map[k] = v.strip()
+        elif isinstance(rel_dict, list):
+            for rel in rel_dict:
+                if isinstance(rel, dict):
+                    key = rel.get("relation") or rel.get("uri") or rel.get("id")
+                    label = rel.get("label") or rel.get("surface_form") or rel.get("text")
+                    if key and label and len(label.strip()) > 2:
+                        clean_map[key] = label.strip()
+        return clean_map
+
+    falcon_relations.update(clean_relations(qrels))
+    falcon_relations.update(clean_relations(db_rels))
+
+    # print("\n=== DEBUG: FALCON RELATIONS CLEANED ===")
+    # print(json.dumps(falcon_relations, indent=2))
+
+    # ------------------- DBpedia Entity Linking -------------------
     dbpedia_spotlight = dbpedia_entity_linking(original_text)
-    dbpedia_entities = merge_and_clean_entities(falcon_dbpedia, dbpedia_spotlight)
+    dbpedia_entities = merge_and_clean_entities(falcon_dbpedia_entities, dbpedia_spotlight)
 
     # Semantic deduplication (same as before)
-    all_labels = list(dbpedia_entities.values()) + list(falcon_dbpedia.values())
+    all_labels = list(dbpedia_entities.values()) + list(falcon_dbpedia_entities.values())#
     unique_labels = {}
     for label in all_labels:
         emb = embedding_model.encode(label, convert_to_tensor=True)
@@ -690,14 +752,43 @@ def enrich_query_with_entities_and_facts(original_text):
     relation_entity_mapping = {}
 
     if falcon_relations:
-        for qid in falcon_qids.keys():
-            for rid, rlabel in falcon_relations.items():
+        for rid, rlabel in falcon_relations.items():
+            for qid, qlabel in falcon_qids.items():
+
+                # 1️⃣ Try to get forward facts first
                 rel_specific = get_entity_facts(qid, property_filter=rid)
+
+                # 2️⃣ If none found, automatically try the reverse direction
+                if not rel_specific:
+                    try:
+                        reverse_query = f"""
+                        SELECT ?target ?targetLabel WHERE {{
+                            ?target wdt:{rid} wd:{qid}.
+                            SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+                        }}
+                        """
+                        reverse_results = run_sparql_query(reverse_query)
+                        rel_specific = []
+                        for res in reverse_results:
+                            rel_specific.append({
+                                "property": rid,
+                                "value": res.get("targetLabel", ""),
+                                "target_qid": res.get("target", ""),
+                                "provenance": "reverse-relation"
+                            })
+                    except Exception as e:
+                        print(f"[WARN] Reverse relation query failed for {rid}/{qid}: {e}")
+
+                # 3️⃣ Record found relations
                 if rel_specific:
                     for f in rel_specific:
-                        f["provenance"] = "relation-filter"
+                        f["provenance"] = f.get("provenance", "relation-filter")
+                        relation_entity_mapping.setdefault(rid, []).append({
+                            "source": qid,
+                            "target": f.get("target_qid"),
+                            "value": f.get("value", "")
+                        })
                     relation_facts.setdefault(rid, []).extend(rel_specific)
-                    relation_entity_mapping.setdefault(rid, []).append(qid)
                     qid_facts_combined.setdefault(qid, []).extend(rel_specific)
 
     # ------------------- Reformulated Query -------------------
@@ -892,7 +983,19 @@ def display_full_pipeline_result(result, max_facts_per_entity=10, show_scores=Tr
         for rid, rlabel in rels.items():
             matching_entities = []
             for eid, facts in result.get('wikidata_facts_combined', {}).items():
-                if any(rlabel.lower() in str(f[0]).lower() or rid in str(f[0]) for f in facts):
+                if any(
+                        (
+                                isinstance(f, dict)
+                                and any(rlabel.lower() in str(v).lower() or rid in str(v) for v in f.values())
+                        ) or (
+                                isinstance(f, (list, tuple))
+                                and any(rlabel.lower() in str(x).lower() or rid in str(x) for x in f)
+                        ) or (
+                                isinstance(f, str)
+                                and (rlabel.lower() in f.lower() or rid in f)
+                        )
+                        for f in facts
+                ):
                     matching_entities.append(result['falcon_qids'].get(eid, eid))
             if matching_entities:
                 found_any = True
