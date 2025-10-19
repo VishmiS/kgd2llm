@@ -22,6 +22,10 @@ def load_text_dataset(name, pos_dir, neg_dir, file_path, neg_K, res_data, split)
     if split == 'train':
         hard_neg_house = load_pickle(neg_dir)
         pos_logits = load_pickle(pos_dir)
+        if not isinstance(pos_logits, dict):
+            raise ValueError(f"[ERROR] Expected pos_logits to be a dict, got {type(pos_logits)} instead.")
+        print(f"✅ Loaded pos_logits with {len(pos_logits)} entries from {pos_dir}")
+
     elif split == 'validation':
         hard_neg_house = {}  # no hard negatives for validation
         pos_logits = load_pickle(pos_dir)  # load validation pos logits
@@ -96,9 +100,16 @@ def load_sts_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data, s
     if split == 'train':
         hard_neg_house = load_pickle(neg_dir)
         pos_logits = load_pickle(pos_dir)
+        if not isinstance(pos_logits, dict):
+            raise ValueError(f"[ERROR] Expected pos_logits to be a dict, got {type(pos_logits)} instead.")
+        print(f"✅ Loaded pos_logits with {len(pos_logits)} entries from {pos_dir}")
+
     else:
         hard_neg_house = {}
         pos_logits = load_pickle(pos_dir)
+        if not isinstance(pos_logits, dict):
+            raise ValueError(f"[ERROR] Expected pos_logits to be a dict, got {type(pos_logits)} instead.")
+        print(f"✅ Loaded pos_logits with {len(pos_logits)} entries from {pos_dir}")
 
     with open(file_path, encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter=',', quoting=csv.QUOTE_MINIMAL)
@@ -169,6 +180,76 @@ def load_sts_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
 
     return res_data, sample_num
 
+# ======== FAST LOOKUP REPLACEMENT ========
+
+from collections import defaultdict
+
+# Global caches for fast lookup
+_pos_tuple_map_cache = {}
+_pos_query_map_cache = {}
+
+def build_fast_lookup_maps(pos_dict):
+    """Build efficient lookup tables for O(1) access."""
+    if id(pos_dict) in _pos_tuple_map_cache:
+        # Already built
+        return _pos_tuple_map_cache[id(pos_dict)], _pos_query_map_cache[id(pos_dict)]
+
+    pos_tuple_map = {}
+    pos_query_map = defaultdict(dict)
+
+    for k, v in pos_dict.items():
+        if isinstance(k, tuple) and len(k) == 2:
+            q, a = k
+        else:
+            # handle serialized keys
+            parts = str(k).split("|||")
+            if len(parts) == 2:
+                q, a = parts
+            else:
+                q, a = str(k), ""
+
+        qn = q.strip().lower()
+        an = a.strip().lower()
+
+        pos_tuple_map[(q, a)] = v
+        pos_query_map[qn][an] = v
+
+    _pos_tuple_map_cache[id(pos_dict)] = pos_tuple_map
+    _pos_query_map_cache[id(pos_dict)] = pos_query_map
+    return pos_tuple_map, pos_query_map
+
+
+def fast_lookup_pos_logit(pos_dict, query, answer):
+    """Ultra-fast lookup (~O(1)) instead of scanning all 500k entries."""
+    pos_tuple_map, pos_query_map = build_fast_lookup_maps(pos_dict)
+    # print(f"⚡ Built fast lookup maps for {len(pos_tuple_map)} entries "
+    #       f"and {len(pos_query_map)} unique queries.")
+
+    # Try direct (query, answer) tuple
+    val = pos_tuple_map.get((query, answer))
+    if val is not None:
+        return val
+
+    # Normalize
+    qn = query.strip().lower()
+    an = answer.strip().lower()
+
+    qmap = pos_query_map.get(qn)
+    if not qmap:
+        return [0.0, 0.0]
+
+    # Exact normalized answer match
+    val = qmap.get(an)
+    if val is not None:
+        return val
+
+    # Fuzzy match (substring)
+    for cand_ans, v in qmap.items():
+        if cand_ans in an or an in cand_ans:
+            return v
+
+    return [0.0, 0.0]
+
 
 def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
     print(f"\n🔄 Loading dataset '{name}'")
@@ -178,6 +259,10 @@ def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
 
     data = []
     pos_logits = load_pickle(pos_dir)
+    if not isinstance(pos_logits, dict):
+        raise ValueError(f"[ERROR] Expected pos_logits to be a dict, got {type(pos_logits)} instead.")
+    print(f"✅ Loaded pos_logits with {len(pos_logits)} entries from {pos_dir}")
+
     hard_neg_house = load_pickle(neg_dir)
 
     # Counters
@@ -213,10 +298,10 @@ def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
             hardneg_logits = list(hardneg_logits)
 
             # Lookup positive logit vector
-            pos_logit_for_sample = pos_logits.get(text_a)
-            if pos_logit_for_sample is None:
+            pos_logit_for_sample = fast_lookup_pos_logit(pos_logits, text_a, text_b)
+
+            if pos_logit_for_sample == [0.0, 0.0]:
                 not_found_count += 1
-                pos_logit_for_sample = [0.0, 0.0]
             else:
                 with_pos_logits += 1
 
@@ -274,7 +359,6 @@ def load_qa_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
     return res_data, sample_num
 
 
-
 def load_mmarco_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
     print(f"\n🔄 Loading dataset '{name}'")
     print(f"  ▶️ Positive pickle file: {pos_dir}")
@@ -283,6 +367,10 @@ def load_mmarco_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data
 
     data = []
     pos_logits = load_pickle(pos_dir)
+    if not isinstance(pos_logits, dict):
+        raise ValueError(f"[ERROR] Expected pos_logits to be a dict, got {type(pos_logits)} instead.")
+    print(f"✅ Loaded pos_logits with {len(pos_logits)} entries from {pos_dir}")
+
     hard_neg_house = load_pickle(neg_dir)
 
     # Counters
@@ -317,12 +405,11 @@ def load_mmarco_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data
             hardnegs = [sample[:320] for sample in hardnegs]
             hardneg_logits = list(hardneg_logits)
 
-            # Lookup positive logit vector (keys are (question, answer) tuples)
-            key = (text_a, text_b)
-            pos_logit_for_sample = pos_logits.get(key)
-            if pos_logit_for_sample is None:
+            # ✅ Use flexible lookup just like QA loader
+            pos_logit_for_sample = fast_lookup_pos_logit(pos_logits, text_a, text_b)
+
+            if pos_logit_for_sample == [0.0, 0.0]:
                 not_found_count += 1
-                pos_logit_for_sample = [0.0, 0.0]
             else:
                 with_pos_logits += 1
 
@@ -340,9 +427,7 @@ def load_mmarco_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data
 
     sample_num = len(data)
     res_data.extend(data)
-
     return res_data, sample_num
-
 
 
 def load_mmarco_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):

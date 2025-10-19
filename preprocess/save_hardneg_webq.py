@@ -1,5 +1,11 @@
 # conda activate faiss-gpu-py38
-# python -m preprocess.save_hardneg_webquestions
+# python /root/pycharm_semanticsearch/preprocess/save_hardneg_webq.py
+
+import sys
+import pathlib
+
+project_root = pathlib.Path(__file__).resolve().parent.parent
+sys.path.append(str(project_root))
 
 import os
 import sys

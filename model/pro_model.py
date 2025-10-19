@@ -9,23 +9,38 @@ from tqdm import tqdm, trange
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, AutoConfig
 
 
+# LoRA-enabled Linear layer
+class LoRALinear(nn.Module):
+    def __init__(self, in_features, out_features, r=8, alpha=32):
+        super().__init__()
+        self.fc = nn.Linear(in_features, out_features)
+        self.lora_A = nn.Linear(in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, out_features, bias=False)
+        self.scaling = alpha / r
+        # Initialize
+        nn.init.zeros_(self.lora_B.weight)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+
+    def forward(self, x):
+        return self.fc(x) + self.lora_B(self.lora_A(x)) * self.scaling
+
+
+# Replace MAB with LoRA-enabled MAB
 class MAB(nn.Module):
     def __init__(self, dim_Q, dim_K, dim_V, num_heads, ln=False):
         super(MAB, self).__init__()
         self.dim_V = dim_V
         self.num_heads = num_heads
-        self.fc_q = nn.Linear(dim_Q, dim_V)
-        self.fc_k = nn.Linear(dim_K, dim_V)
-        self.fc_v = nn.Linear(dim_K, dim_V)
+        self.fc_q = LoRALinear(dim_Q, dim_V)
+        self.fc_k = LoRALinear(dim_K, dim_V)
+        self.fc_v = LoRALinear(dim_K, dim_V)
 
         if ln:
             self.ln0 = nn.LayerNorm(dim_V)
             self.ln1 = nn.LayerNorm(dim_V)
         self.fc_o = nn.Linear(dim_V, dim_V)
-        nn.init.xavier_uniform_(self.fc_q.weight)
-        nn.init.xavier_uniform_(self.fc_k.weight)
-        nn.init.xavier_uniform_(self.fc_v.weight)
         nn.init.xavier_uniform_(self.fc_o.weight)
+
 
 
 class PMA(nn.Module):
@@ -41,8 +56,8 @@ class PMA(nn.Module):
     #     return self.mab(self.S.repeat(X.size(0), 1, 1), X, pad_mask)
 
     def forward(self, Q, K, pad_mask=None):
-        # Ensure Q, K match the dtype of model weights
-        dtype = self.mab.fc_q.weight.dtype
+        # Ensure Q, K match the dtype of the underlying weight
+        dtype = next(self.mab.fc_q.parameters()).dtype
         Q = Q.to(dtype)
         K = K.to(dtype)
 
@@ -128,7 +143,7 @@ class Mymodel(nn.Module):
             else:
                 self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.tokenizer.pad_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.pad_token)
-        self.plm_model = AutoModelForCausalLM.from_pretrained(self.model_name_or_path, trust_remote_code=True)
+        self.plm_model = AutoModel.from_pretrained(self.model_name_or_path, trust_remote_code=True)
         self.emb_dim = self.plm_model.config.hidden_size
         self.num_heads = args.num_heads
         self.ln = args.ln
@@ -153,13 +168,24 @@ class Mymodel(nn.Module):
         output_embeddings_b = output_embeddings_all[1]
 
         bs = output_embeddings_a.size(0)
-        a_expand_emb = output_embeddings_a.unsqueeze(1).expand(-1, bs, -1).reshape(-1, self.emb_dim)
-        b_expand_emb = output_embeddings_b.unsqueeze(0).expand(bs, -1, -1).reshape(-1, self.emb_dim)
+        # Create in-batch pairs: each a with all b
+        a_expand_emb = output_embeddings_a.unsqueeze(1).expand(-1, bs, -1)  # [bs, bs, emb_dim]
+        b_expand_emb = output_embeddings_b.unsqueeze(0).expand(bs, -1, -1)  # [bs, bs, emb_dim]
 
-        task_expand = task_ids.unsqueeze(1).expand(-1, bs).reshape(-1)
-        output_in_batch, _ = self.iem(a_expand_emb, b_expand_emb)  # (bs*bs, 2)
-        output_in_batch_specific_task = output_in_batch[torch.arange(task_expand.size(0)), task_expand]
-        output_in_batch_specific_task = output_in_batch_specific_task.reshape(bs, -1)
+        # Flatten to feed into IEM
+        a_flat = a_expand_emb.reshape(bs * bs, self.emb_dim)
+        b_flat = b_expand_emb.reshape(bs * bs, self.emb_dim)
+
+        # Compute logits for all pairs
+        logits_all_pairs, _ = self.iem(a_flat, b_flat)  # [bs*bs, 2]
+
+        # Reshape to [bs, bs, 2] to match in-batch structure
+        logits_all_pairs = logits_all_pairs.reshape(bs, bs, -1)
+
+        # Extract logits for the specific task
+        task_expand = task_ids.unsqueeze(1).expand(-1, bs)  # [bs, bs]
+        output_in_batch_specific_task = logits_all_pairs.gather(2, task_expand.unsqueeze(-1)).squeeze(-1)
+        # Now output_in_batch_specific_task has shape [bs, bs], where first column corresponds to positives
 
         if mode == 'train':
             pos_neg_emb = torch.cat([output_embeddings_b.unsqueeze(0), output_embeddings_hardneg], dim=0)

@@ -12,9 +12,37 @@ from dataset.dataset import *
 from model.pro_model import *
 from utils.common_utils import *
 from loss import cal_loss_in_batch, cal_loss_hardneg, cal_loss_rd, cal_loss_rd2, cal_feat_loss
-
+from deepspeed.ops.adam import DeepSpeedCPUAdam
 logging.getLogger().setLevel(logging.INFO)
 warnings.filterwarnings('ignore')
+
+import torch
+
+def compute_ranking_metrics(scores, labels, k=10):
+    """
+    scores: [batch_size, num_candidates] (higher = better)
+    labels: [batch_size, num_candidates] (1 for positive, 0 for negatives)
+    """
+    batch_size = scores.size(0)
+    mrr_total = 0.0
+    ndcg_total = 0.0
+
+    _, indices = scores.topk(k, dim=-1)
+    for i in range(batch_size):
+        ranked_labels = labels[i][indices[i]]
+        # MRR@k
+        pos_idx = (ranked_labels == 1).nonzero(as_tuple=True)[0]
+        if len(pos_idx) > 0:
+            mrr_total += 1.0 / (pos_idx[0].item() + 1)
+        # NDCG@k
+        gains = 2 ** ranked_labels.float() - 1
+        discounts = torch.log2(torch.arange(2, k + 2, device=scores.device).float())
+        dcg = (gains / discounts).sum()
+        ideal_gains = 2 ** torch.sort(ranked_labels, descending=True)[0].float() - 1
+        idcg = (ideal_gains / discounts).sum()
+        ndcg_total += (dcg / idcg).item() if idcg > 0 else 0.0
+
+    return mrr_total / batch_size, ndcg_total / batch_size
 
 
 
@@ -80,8 +108,8 @@ def evaluate_and_save(model_engine, val_dataloader, model, args, current_epoch, 
     else:
         stop += 1
 
-    if stop < args.num_ckpt:
-        save_flag = True
+    # if stop < args.num_ckpt:
+    #     save_flag = True
 
     if save_flag and args.global_rank == 0:
         output_dir_current = os.path.join(
@@ -109,7 +137,7 @@ def main():
     parser.add_argument('--output_dim', default=1, type=int, help='output dim of my mlp')
     parser.add_argument('--ln', default=True, type=str2bool, help='layer norm for pma')
     parser.add_argument('--norm', default=False, type=str2bool, help='norm after sentence pooling')
-    parser.add_argument('--num_epochs', default=5, type=int, help='training epochs')
+    parser.add_argument('--num_epochs', default=10, type=int, help='training epochs')
     parser.add_argument('--padding_side', default='right', type=str, help='padding side')
     parser.add_argument('--max_seq_length', default=250, type=int, help='max_seq_len')
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
@@ -142,6 +170,15 @@ def main():
     args = parser.parse_args()
     args.world_size = int(os.getenv('WORLD_SIZE', '0'))
 
+    # --- Ensure num_epochs is the value you expect ---
+    # Reason: deepspeed/launcher or environment might override parser defaults.
+    # You can set NUM_EPOCHS env var to override; otherwise change the '10' below.
+    desired_epochs = int(os.getenv('NUM_EPOCHS', '5'))  # <- change '10' to the default you want
+    args.num_epochs = desired_epochs
+
+    # Debug print so you can confirm what's actually used at run time
+    print(f"[ConfigCheck] WORLD_SIZE={args.world_size}, num_epochs={args.num_epochs}")
+
     sigmoid = nn.Sigmoid()
     tanh = nn.Tanh()
 
@@ -162,18 +199,15 @@ def main():
 
     summary_writer = SummaryWriter(log_dir=args.tb_dir)
 
-    train_data_flag = False
     lora_config = LoraConfig(
-    r = 8,
-    lora_alpha = 8,
-    target_modules = ['c_attn', 'c_proj', 'w1', 'w2'],
-    layers_to_transform = list(range(0, 32)),
-    lora_dropout = 0.05,
-    bias = "none",
-    inference_mode = False,
-    task_type = TaskType.CAUSAL_LM
+        task_type="CAUSAL_LM",  # or "SEQ_CLS" depending on your task
+        inference_mode=False,
+        r=8,
+        lora_alpha=32,
+        lora_dropout=0.1,
+        target_modules=["fc_q", "fc_k", "fc_v"]  # your custom MAB layer names
     )
-    model.plm_model = get_peft_model(model.plm_model, lora_config)
+
 
     update_parameters = filter(lambda p: p.requires_grad, model.parameters())
     param_optimizer = list([(n, p) for n, p in model.named_parameters() if p.requires_grad])
@@ -187,42 +221,72 @@ def main():
     {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
      'lr': args.lr, 'weight_decay': 0.0, 'betas': [0.8, 0.999], 'eps': 1e-6, 'name': 'nd'}]
 
+    # --- Replace everything from 'from deepspeed.ops.adam import DeepSpeedCPUAdam'
+    # --- down to the call to deepspeed.initialize(...) with this block ---
+
+    from torch.optim import AdamW  # use standard GPU optimizer instead of DeepSpeedCPUAdam
+
+    # ✅ Define standard AdamW optimizer
+    optimizer = AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        betas=(0.8, 0.999),
+        eps=1e-6,
+        weight_decay=args.weight_decay
+    )
+
+    # ✅ Clean, GPU-friendly DeepSpeed config (no CPU offload)
     ds_config = {
-    "bfloat16": {
-        "enabled": args.bf16
-    },
-    "zero_optimization": {
-        "stage": 2,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": True
+        "train_batch_size": args.batch_size * args.gradient_accumulation_steps * max(1, args.world_size),
+        "train_micro_batch_size_per_gpu": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "gradient_clipping": args.gradient_clipping,
+        "bfloat16": {"enabled": args.bf16},  # keep BF16 if supported
+        "fp16": {"enabled": False},  # explicitly disable FP16
+        "zero_optimization": {
+            "stage": 2,
+            "offload_optimizer": {"device": "none"},  # keep optimizer on GPU
+            "offload_param": {"device": "none"}
         },
-        "allgather_partitions": True,
-        "allgather_bucket_size": 2e8,
-        "overlap_comm": True,
-        "reduce_scatter": True,
-        "reduce_bucket_size": 2e8,
-        "contiguous_gradients": True
-    },
-    "gradient_accumulation_steps": args.gradient_accumulation_steps,
-    "gradient_clipping": args.gradient_clipping,
-    "train_batch_size": args.batch_size * args.gradient_accumulation_steps * args.world_size,
-    "train_micro_batch_size_per_gpu": args.batch_size,
-    "steps_per_print": 1e5
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": args.lr,
+                "betas": [0.8, 0.999],
+                "eps": 1e-6,
+                "weight_decay": args.weight_decay
+            }
+        }
     }
 
-    fake_bs = ds_config['train_micro_batch_size_per_gpu']
-    optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(optimizer_grouped_parameters)
-    scheduler = deepspeed.runtime.lr_schedules.WarmupLR(optimizer, warmup_min_lr=[0, 0], warmup_max_lr=[args.lr, args.lr],
-    warmup_num_steps = 1000)
+    # ✅ Initialize DeepSpeed engine
+    model_engine, optimizer, _, scheduler = deepspeed.initialize(
+        args=args,
+        model=model,
+        optimizer=optimizer,
+        model_parameters=[p for p in model.parameters() if p.requires_grad],
+        config=ds_config
+    )
 
-    model_engine, optimizer, _, scheduler = deepspeed.initialize(args=args, model=model, model_parameters=update_parameters,
-                                                                 optimizer=optimizer, lr_scheduler=scheduler,
-                                                                 config=ds_config)
-    device = torch.device(args.local_rank)
+    print(
+        f"[InitCheck] BF16 enabled: {ds_config['bfloat16']['enabled']} | "
+        f"Optimizer offload: {ds_config['zero_optimization']['offload_optimizer']['device']}"
+    )
+
+    if not torch.distributed.is_initialized():
+        dist.init_process_group(backend='nccl')
+    args.global_rank = dist.get_rank()
+    args.local_rank = dist.get_rank()
+    device = torch.device(f"cuda:{args.local_rank}")
     args.device = device
-    args.global_rank = torch.distributed.get_rank()
+    torch.cuda.set_device(device)
 
+    # === Diagnostic: Check number of trainable parameters ===
+    num_trainable = sum(p.numel() for p in model_engine.parameters() if p.requires_grad)
+    num_frozen = sum(p.numel() for p in model_engine.parameters() if not p.requires_grad)
+    print(f"[Debug] Trainable parameters: {num_trainable:,} | Frozen parameters: {num_frozen:,}")
+    if num_trainable == 0:
+        raise ValueError("❌ All parameters are frozen — nothing will update!")
 
     train_dataset = TrainDataset(model.tokenizer, pos_dir=args.pos_dir, neg_dir=args.neg_dir, datadir=args.data_dir,
                                  names=args.train_data_list, batch_size=micro_bs, neg_K=args.neg_K,
@@ -236,10 +300,25 @@ def main():
     else:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
         val_sampler = DistributedSampler(val_dataset)
-    train_dataloader = DataLoader(train_dataset, batch_size=fake_bs, shuffle=False, sampler=train_sampler,
-                                  collate_fn=collate_fn, num_workers=0)
-    val_dataloader = DataLoader(val_dataset, batch_size=fake_bs, shuffle=False, sampler=val_sampler, collate_fn=collate_fn,
-                                num_workers=0)
+    # ✅ Use actual micro batch size (no fake_bs variable)
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=micro_bs,
+        shuffle=False,
+        sampler=train_sampler,
+        collate_fn=collate_fn,
+        num_workers=0
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=micro_bs,
+        shuffle=False,
+        sampler=val_sampler,
+        collate_fn=collate_fn,
+        num_workers=0
+    )
+
     print("Length of Train Dataset:",len(train_dataset))
     if len(train_dataset) > 0:
         train_data_flag = True
@@ -269,27 +348,41 @@ def main():
     teacher_feature_cos_dict = load_pickle(args.feature_pkl_path_dir)
     teacher_inbatch_logits_dict = load_pickle(args.inbatch_pkl_path_dir)
 
-    reduce_loss = 0
-    reduce_loss_eval = 0
-    reduce_loss_in_batch = 0
-    reduce_loss_in_batch_eval = 0
-    reduce_loss_hardneg = 0
-    reduce_loss_rd = 0
-    reduce_loss_rd2 = 0
-    reduce_loss_feat = 0
+    # reduction accumulators must be torch tensors on device for dist.all_reduce
+    reduce_loss = torch.zeros(1, device='cuda' if torch.cuda.is_available() else 'cpu')
+    reduce_loss_eval = torch.zeros(1, device='cuda' if torch.cuda.is_available() else 'cpu')
+    reduce_loss_in_batch = torch.zeros(1, device='cuda' if torch.cuda.is_available() else 'cpu')
+    reduce_loss_in_batch_eval = torch.zeros(1, device='cuda' if torch.cuda.is_available() else 'cpu')
+    reduce_loss_hardneg = torch.zeros(1, device='cuda' if torch.cuda.is_available() else 'cpu')
+    reduce_loss_rd = torch.zeros(1, device='cuda' if torch.cuda.is_available() else 'cpu')
+    reduce_loss_rd2 = torch.zeros(1, device='cuda' if torch.cuda.is_available() else 'cpu')
+    reduce_loss_feat = torch.zeros(1, device='cuda' if torch.cuda.is_available() else 'cpu')
     reduce_inbatch_sample_num = {}
 
+    epoch_loss_overall = 0.0
+    epoch_loss_inbatch = 0.0
+    epoch_loss_hardneg = 0.0
+    epoch_loss_rd = 0.0
+    epoch_loss_rd2 = 0.0
+    epoch_loss_feat = 0.0
+    num_train_batches = 0
+
     print("About to start training loop...")
+    logging.info(f"\nAbout to start training loop...")
 
     for current_epoch in trange(int(args.num_epochs), desc="Epoch", disable=(args.global_rank != 0), mininterval=0):
 
         torch.autograd.set_detect_anomaly(True)
-        if stop >= args.patience:
-            logging.info(f'Early Stop at {current_epoch + 1}-th epoch {global_step}-th step')
-            logging.info(f'Model trained!\nThe best model at {best_epoch + 1}-th epoch {best_step}-th step')
-            break
+        if False:
+            pass
         torch.cuda.empty_cache()
         model_engine.train()
+
+        # Start of epoch logging
+        logging.info(f"Starting Epoch {current_epoch + 1}/{args.num_epochs}")
+        epoch_mrr10 = 0.0
+        epoch_ndcg10 = 0.0
+        num_mrr_batches = 0
 
         loss_epoch_eval = 0
 
@@ -301,40 +394,73 @@ def main():
             sentence_a, sentence_b, logits_teacher_pos, sentence_hardneg, logits_teacher_hardneg, task_id = batch
             sentence_all = sentence_a + sentence_b + sentence_hardneg
             bs = logits_teacher_pos.size(0)
-            key = 'global_rank' + str(args.global_rank)
-
+            key = f'global_rank{args.global_rank}'
 
             if key not in teacher_inbatch_logits_dict:
-                print(f"Available keys in teacher_inbatch_logits_dict: {list(teacher_inbatch_logits_dict.keys())}")
-                raise KeyError(f"Key '{key}' not found in teacher_inbatch_logits_dict.")
+                print(
+                    f"[Error] Missing key '{key}' in teacher_inbatch_logits_dict. Available keys: {list(teacher_inbatch_logits_dict.keys())}")
+                raise KeyError(f"Missing key '{key}' in teacher_inbatch_logits_dict.")
 
-            if step >= len(teacher_inbatch_logits_dict[key]):
-                raise IndexError(
-                    f"Step {step} out of range for teacher_inbatch_logits_dict[{key}] with length {len(teacher_inbatch_logits_dict[key])}.")
+            rank_data = teacher_inbatch_logits_dict[key]
 
-            # print(f"Keys in teacher_inbatch_logits_dict: {list(teacher_inbatch_logits_dict.keys())}")
-            # print(f"Length of teacher_inbatch_logits_dict[{key}]: {len(teacher_inbatch_logits_dict[key])}")
+            # Handle double nesting if needed
+            if isinstance(rank_data, dict) and key in rank_data:
+                print(f"[Info] Detected double nesting for {key}. Accessing inner dictionary...")
+                rank_data = rank_data[key]
 
-            value = teacher_inbatch_logits_dict[key][step]
-            print(type(value))
+            # Now handle the actual structure
+            if isinstance(rank_data, dict):
+                step_key = str(step)
+                if step_key not in rank_data:
+                    print(
+                        f"[Error] Step key '{step_key}' not found in teacher_inbatch_logits_dict[{key}]. Available step keys: {list(rank_data.keys())[:5]}...")
+                    raise KeyError(f"Step key '{step_key}' missing in teacher_inbatch_logits_dict[{key}]")
+                logits_teacher_inbatch = rank_data[step_key].to(device)
+            else:
+                if step >= len(rank_data):
+                    print(
+                        f"[Error] Step {step} out of range for teacher_inbatch_logits_dict[{key}] (len={len(rank_data)})")
+                    raise IndexError(f"Step {step} out of range for teacher_inbatch_logits_dict[{key}]")
+                logits_teacher_inbatch = rank_data[step].to(device)
 
-
-            logits_teacher_inbatch = teacher_inbatch_logits_dict[key][step].to(device)
+            # logits_teacher_inbatch = teacher_inbatch_logits_dict[key][step].to(device)
             feature_teacher_cos = teacher_feature_cos_dict[key][step].to(device)
+
+            # Normalize teacher logits for in-batch and hard-neg
+
+            # 1. Reshape hardneg
+            # --- Robust teacher logits processing and normalization ---
+            # Ensure teacher positive logits shape: [B, 1, 2]
+            # --- Robust teacher logits processing and normalization ---
+            # Ensure logits_teacher_pos shape: [B, 1, D]
+            if logits_teacher_pos.dim() == 2:  # shape [B, D] or [B, 1]
+                logits_teacher_pos = logits_teacher_pos.unsqueeze(1)  # [B,1,D]
+
+            # Ensure logits_teacher_hardneg shape: [B, neg_K, D]
+            logits_teacher_hardneg = logits_teacher_hardneg.view(bs, args.neg_K, -1)
+
+            # Make sure last dimension matches logits_teacher_hardneg
+            if logits_teacher_pos.size(-1) != logits_teacher_hardneg.size(-1):
+                logits_teacher_pos = logits_teacher_pos.expand(-1, -1, logits_teacher_hardneg.size(-1))
+
+            # Concatenate positive and hardneg along dim=1: [B, neg_K+1, D]
+            logits_teacher_hardneg = torch.cat([logits_teacher_pos, logits_teacher_hardneg], dim=1)
+
+            # Move to device
+            logits_teacher_hardneg = logits_teacher_hardneg.to(device)
+            logits_teacher_inbatch = logits_teacher_inbatch.to(device)
+
+            # Normalize along last dimension (mean-centering) and clamp
+            logits_teacher_inbatch = logits_teacher_inbatch - logits_teacher_inbatch.mean(dim=-1, keepdim=True)
+            logits_teacher_hardneg = logits_teacher_hardneg - logits_teacher_hardneg.mean(dim=-1, keepdim=True)
+            logits_teacher_inbatch = torch.clamp(logits_teacher_inbatch, -5, 5)
+            logits_teacher_hardneg = torch.clamp(logits_teacher_hardneg, -5, 5)
 
 
             # print(f"Type of teacher_feature_cos_dict[{key}]: {type(teacher_feature_cos_dict[key])}")
             # print(f"Length of teacher_feature_cos_dict[{key}]: {len(teacher_feature_cos_dict[key])}")
             # print(f"Type of first element: {type(teacher_feature_cos_dict[key][0])}")
             # print(f"Sample at step {step}: {sample}")
-
-
-            # feature_teacher_cos = teacher_feature_cos_dict[key][step].to(device)
-
-            # inner_dict = teacher_feature_cos_dict[key]
-            # query_key = list(inner_dict.keys())[step]
-            # sample2 = inner_dict[query_key]
-            # feature_teacher_cos = [torch.tensor(logits, dtype=torch.float32).to(device) for _, logits in sample2]
 
             inputs_all = model.tokenizer(sentence_all, padding='max_length', max_length=args.max_seq_length,
                                          truncation=True, return_tensors='pt')
@@ -343,14 +469,25 @@ def main():
             logits_student_in_batch, logits_student_hardneg, rep_student_pos_hardneg = model_engine(inputs_all, task_id,
                                                                                                     'train')
 
+            # --- Normalize student logits (avoid division by zero) ---
+            eps = 1e-12
+            _student_dtype = logits_student_in_batch.dtype
+            logits_student_in_batch = logits_student_in_batch.float()
+            logits_student_hardneg = logits_student_hardneg.float()
+
+            logits_student_in_batch = logits_student_in_batch / (logits_student_in_batch.norm(dim=-1, keepdim=True) + eps)
+            logits_student_hardneg = logits_student_hardneg / (logits_student_hardneg.norm(dim=-1, keepdim=True) + eps)
+
+            logits_student_in_batch = logits_student_in_batch.to(_student_dtype)
+            logits_student_hardneg = logits_student_hardneg.to(_student_dtype)
+            # -----------------------------------------------------
+
             loss_in_batch = cal_loss_in_batch(args, logits_student_in_batch, args.temperature_in_batch, criterion)
+
             logits_teacher_pos = logits_teacher_pos.to(args.device)
             # print(f"[Debug] logits_teacher_hardneg.shape before reshape: {logits_teacher_hardneg.shape}")
             # print(f"[Debug] Expected reshape: ({micro_bs}, {args.neg_K}, 2) = {micro_bs * args.neg_K * 2}")
             # print(f"[Debug] Actual total elements: {logits_teacher_hardneg.numel()}")
-
-            # Ensure logits_teacher_hardneg has shape [B, K, D]
-            logits_teacher_hardneg = logits_teacher_hardneg.reshape(micro_bs, args.neg_K, -1).to(args.device)
 
             # Ensure logits_teacher_pos has shape [B, 1, D] to match hardneg
             logits_teacher_pos = logits_teacher_pos.to(args.device)
@@ -359,11 +496,8 @@ def main():
             if logits_teacher_pos.dim() == 2:  # shape [B, D] or [B, 1]
                 logits_teacher_pos = logits_teacher_pos.unsqueeze(-1) if logits_teacher_pos.size(
                     1) == 1 else logits_teacher_pos
-                logits_teacher_pos = logits_teacher_pos.expand(-1, 1, last_dim)  # [B, 1, D]
-
-            # Concatenate along dim=1 (negatives dimension)
-            logits_teacher_hardneg = torch.cat([logits_teacher_pos, logits_teacher_hardneg], dim=1)
-
+                if logits_teacher_pos.dim() == 2:
+                    logits_teacher_pos = logits_teacher_pos.unsqueeze(1)  # [B, 1, D]
 
 
             print(f"logits_teacher_pos.shape: {logits_teacher_pos.shape}")  # Should be [micro_bs, 2]
@@ -396,6 +530,29 @@ def main():
             print("[Debug] logits_teacher_inbatch.shape:", logits_teacher_inbatch.shape)
             print("[Debug] micro_bs:", micro_bs)
 
+            # Ensure positive teacher logits are higher than negatives for all dimensions
+            pos_logits = logits_teacher_hardneg[:, 0:1, :].clone()  # [B,1,D]
+            neg_logits = logits_teacher_hardneg[:, 1:, :].clone()  # [B,neg_K,D]
+
+            # Compute per-sample max of negatives across dim=1
+            max_neg = neg_logits.max(dim=1, keepdim=True)[0]  # [B,1,D]
+
+
+            # Update the logits_teacher_hardneg
+            logits_teacher_hardneg[:, 0:1, :] = pos_logits
+
+            # print("Teacher logits (pos) raw:", logits_teacher_pos[:2])
+            # print("Teacher logits (neg) raw:", logits_teacher_hardneg[:2])
+            # print("Teacher logits (pos):", logits_teacher_hardneg[:, 0, :].mean().item())
+            # print("Teacher logits (neg):", logits_teacher_hardneg[:, 1:, :].mean().item())
+            print(f"Teacher logits (pos[1]): {logits_teacher_pos[..., 1].mean().item():.4f}")
+            print(f"Teacher logits (neg[1]): {logits_teacher_hardneg[..., 1].mean().item():.4f}")
+
+            print("Teacher logits inbatch pos mean/std:", logits_teacher_inbatch[:, :, 1].mean().item(),
+                  logits_teacher_inbatch[:, :, 1].std().item())
+            print("Teacher logits hardneg mean/std:", logits_teacher_hardneg[:, :, 1].mean().item(),
+                  logits_teacher_hardneg[:, :, 1].std().item())
+
             assert logits_teacher_inbatch.shape == (micro_bs, micro_bs - 1, 2)
 
             loss_rd2 = cal_loss_rd2(args, logits_teacher_hardneg, logits_teacher_inbatch, args.temperature_teacher_hardneg,
@@ -413,70 +570,193 @@ def main():
             print("loss_rd:", loss_rd)
             print("loss_feat:", loss_feat)
 
-            loss_batch = loss_in_batch + loss_hardneg + loss_rd2 + loss_rd + loss_feat
+            # Compute MRR@10 / NDCG@10 for in-batch logits
+            # Construct labels: 1 for positive, 0 for negatives
+            bs, num_candidates = logits_student_in_batch.shape
+            labels_batch = torch.zeros_like(logits_student_in_batch)
+            labels_batch[:, 0] = 1  # first candidate is positive
+
+            mrr10, ndcg10 = compute_ranking_metrics(logits_student_in_batch, labels_batch, k=10)
+            epoch_mrr10 += mrr10
+            epoch_ndcg10 += ndcg10
+            num_mrr_batches += 1
+
+            # Optional: log to console and TensorBoard
+            if args.global_rank == 0 and step % args.log_interval == 0:
+                train_log_dict = {}
+                print(f"[Debug] Step {step} | MRR@10: {mrr10:.4f} | NDCG@10: {ndcg10:.4f}")
+                train_log_dict['MRR@10'] = mrr10
+                train_log_dict['NDCG@10'] = ndcg10
+                write_tensorboard(summary_writer, train_log_dict, global_step)
+
+            # Weighted combination of loss components (tunable)
+            loss_batch = (
+                    args.alpha * loss_in_batch +
+                    args.beta * loss_hardneg +
+                    args.gamma * (loss_rd + loss_rd2) +
+                    args.eta * loss_feat
+            )
             if args.verbose:
                 batch_iterator.set_description(
                     f"Epoch: {current_epoch + 1}/{args.num_epochs}, Batch:{step}/{len(train_dataloader)}, Loss: {loss_batch:9.4f}")
 
             # Before backward
-            model_engine.zero_grad()
+            loss_batch = loss_batch.float()  # ensure float
 
+            # === Diagnostic: Check gradient flow ===
+            # Backward
             model_engine.backward(loss_batch)
+
+            # === Diagnostic: Check gradient flow (after backward, before step) ===
+            if step % 50 == 0:  # every 50 steps
+                grad_magnitudes = []
+                # use model_engine.module if available to access wrapped model parameters
+                param_source = getattr(model_engine, "module", model_engine)
+                for n, p in param_source.named_parameters():
+                    if p.requires_grad:
+                        # Some parameters under ZeRO might not have .grad on this rank; guard for None.
+                        if p.grad is None:
+                            continue
+                        # convert to float (avoid overflow with bfloat16)
+                        try:
+                            gm = float(p.grad.abs().mean().item())
+                        except Exception:
+                            try:
+                                gm = float(p.grad.abs().mean().to('cpu').item())
+                            except Exception:
+                                gm = None
+                        if gm is not None:
+                            grad_magnitudes.append(gm)
+
+                if grad_magnitudes:
+                    mean_grad = sum(grad_magnitudes) / len(grad_magnitudes)
+                    print(
+                        f"[GradCheck] Step {step}: mean grad magnitude = {mean_grad:.6e} (checked {len(grad_magnitudes)} params)")
+                else:
+                    print(f"[GradCheck] Step {step}: ⚠️ No gradients found after backward!")
+
+            # Then step
             model_engine.step()
+
+
+            if step % 200 == 0 and hasattr(optimizer, 'param_groups'):
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"[LRCheck] Step {step}: current LR = {current_lr:.6e}")
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 global_step += 1
 
-            reduce_loss += loss_batch.detach()
-            reduce_loss_in_batch += loss_in_batch.detach()
-            reduce_loss_hardneg += loss_hardneg.detach()
-            reduce_loss_rd += loss_rd.detach()
-            reduce_loss_rd2 += loss_rd2.detach()
-            reduce_loss_feat += loss_feat.detach()
+            # --- Accumulate raw per-batch losses for full-epoch averaging ---
+            epoch_loss_overall += loss_batch.detach().item()
+            epoch_loss_inbatch += loss_in_batch.detach().item()
+            epoch_loss_hardneg += loss_hardneg.detach().item()
+            epoch_loss_rd += loss_rd.detach().item()
+            epoch_loss_rd2 += loss_rd2.detach().item()
+            epoch_loss_feat += loss_feat.detach().item()
+            num_train_batches += 1
 
-            if global_step % args.log_interval == 0:
-                dist.all_reduce(reduce_loss, op=dist.ReduceOp.SUM)
-                dist.all_reduce(reduce_loss_in_batch, op=dist.ReduceOp.SUM)
-                dist.all_reduce(reduce_loss_hardneg, op=dist.ReduceOp.SUM)
-                dist.all_reduce(reduce_loss_rd, op=dist.ReduceOp.SUM)
-                dist.all_reduce(reduce_loss_rd2, op=dist.ReduceOp.SUM)
-                dist.all_reduce(reduce_loss_feat, op=dist.ReduceOp.SUM)
+            # --- Optional: short-interval logging for console/TensorBoard ---
+            if global_step % args.log_interval == 0 and args.global_rank == 0:
+                print(
+                    f"[TrainStep {global_step}] "
+                    f"Loss: {loss_batch.item():.4f} | "
+                    f"InBatch: {loss_in_batch.item():.4f} | "
+                    f"HardNeg: {loss_hardneg.item():.4f} | "
+                    f"RD: {loss_rd.item():.4f} | "
+                    f"RD2: {loss_rd2.item():.4f} | "
+                    f"Feat: {loss_feat.item():.6f}"
+                )
 
-                reduce_loss = reduce_loss.item() / (args.gradient_accumulation_steps * args.log_interval * args.world_size)
-                reduce_loss_in_batch = reduce_loss_in_batch.item() / (
-                            args.gradient_accumulation_steps * args.log_interval * args.world_size)
-                reduce_loss_hardneg = reduce_loss_hardneg.item() / (
-                            args.gradient_accumulation_steps * args.log_interval * args.world_size)
-                reduce_loss_rd = reduce_loss_rd.item() / (
-                            args.gradient_accumulation_steps * args.log_interval * args.world_size)
-                reduce_loss_rd2 = reduce_loss_rd2.item() / (
-                            args.gradient_accumulation_steps * args.log_interval * args.world_size)
-                reduce_loss_feat = reduce_loss_feat.item() / (
-                            args.gradient_accumulation_steps * args.log_interval * args.world_size)
+                train_log_dict = {
+                    'loss_overall': loss_batch.item(),
+                    'loss_inbatch': loss_in_batch.item(),
+                    'loss_hardneg': loss_hardneg.item(),
+                    'loss_rd': loss_rd.item(),
+                    'loss_rd2': loss_rd2.item(),
+                    'loss_feat': loss_feat.item(),
+                }
+                write_tensorboard(summary_writer, train_log_dict, global_step)
 
-                if args.global_rank == 0:
-                    train_log_dict = {}
-                    train_log_dict['loss_overall'] = reduce_loss
-                    train_log_dict['loss_inbatch'] = reduce_loss_in_batch
-                    train_log_dict['loss_hardneg'] = reduce_loss_hardneg
-                    train_log_dict['loss_rd'] = reduce_loss_rd
-                    train_log_dict['loss_rd2'] = reduce_loss_rd2
-                    train_log_dict['loss_feat'] = reduce_loss_feat
-                    write_tensorboard(summary_writer, train_log_dict, global_step)
+        # --- Evaluate and optionally save based on validation loss ---
+        # --- Save best checkpoint based on MRR@10 instead of validation loss ---
+        avg_mrr10 = epoch_mrr10 / max(1, num_mrr_batches)
+        avg_ndcg10 = epoch_ndcg10 / max(1, num_mrr_batches)
 
-                reduce_loss = 0
-                reduce_loss_hardneg = 0
-                reduce_loss_rd = 0
-                reduce_loss_rd2 = 0
-                reduce_loss_feat = 0
-                reduce_loss_in_batch = 0
-        stop, min_reduce_loss_eval, best_epoch, best_step, early_stop = evaluate_and_save(
-            model_engine, val_dataloader, model, args, current_epoch, global_step, summary_writer,
-            criterion, min_reduce_loss_eval, best_epoch, best_step, stop
+        if args.global_rank == 0:
+            # Always save checkpoint for each epoch
+            epoch_ckpt_dir = os.path.join(args.output_dir, f"checkpoint-epoch-{current_epoch + 1}")
+            os.makedirs(epoch_ckpt_dir, exist_ok=True)
+            save_model(model_engine, epoch_ckpt_dir,
+                       client_state={"epoch": current_epoch + 1, "global_step": global_step})
+            print(f"[Checkpoint] Saved epoch {current_epoch + 1} to {epoch_ckpt_dir}")
+
+            # Update best model if MRR improved
+            if avg_mrr10 > best_eval_metric:
+                best_eval_metric = avg_mrr10
+                best_epoch = current_epoch
+                best_step = global_step
+                best_checkpoint_path = epoch_ckpt_dir
+                print(f"🌟 New best MRR@10: {best_eval_metric:.4f} at epoch {current_epoch + 1}")
+
+        # Optional early stopping (no longer based on loss)
+        early_stop = False
+
+
+        avg_mrr10 = epoch_mrr10 / max(1, num_mrr_batches)
+        avg_ndcg10 = epoch_ndcg10 / max(1, num_mrr_batches)
+
+        if args.global_rank == 0 and num_train_batches > 0:
+            avg_train_loss = epoch_loss_overall / num_train_batches
+            avg_train_loss_inbatch = epoch_loss_inbatch / num_train_batches
+            avg_train_loss_hardneg = epoch_loss_hardneg / num_train_batches
+            avg_train_loss_rd = epoch_loss_rd / num_train_batches
+            avg_train_loss_rd2 = epoch_loss_rd2 / num_train_batches
+            avg_train_loss_feat = epoch_loss_feat / num_train_batches
+
+            logging.info(
+                f"Epoch {current_epoch + 1}/{args.num_epochs} Train Loss: {avg_train_loss:.4f} | "
+                f"InBatch: {avg_train_loss_inbatch:.4f} | HardNeg: {avg_train_loss_hardneg:.4f} | "
+                f"RD: {avg_train_loss_rd:.4f} | RD2: {avg_train_loss_rd2:.4f} | "
+                f"Feat: {avg_train_loss_feat:.6f} | "
+                f"MRR@10: {avg_mrr10:.4f} | NDCG@10: {avg_ndcg10:.4f}"
+            )
+
+            # Optional: log to TensorBoard
+            train_log_dict = {
+                'loss_overall': avg_train_loss,
+                'loss_inbatch': avg_train_loss_inbatch,
+                'loss_hardneg': avg_train_loss_hardneg,
+                'loss_rd': avg_train_loss_rd,
+                'loss_rd2': avg_train_loss_rd2,
+                'loss_feat': avg_train_loss_feat,
+                'MRR@10': avg_mrr10,
+                'NDCG@10': avg_ndcg10,
+            }
+            write_tensorboard(summary_writer, train_log_dict, global_step)
+
+    # === Log the best checkpoint info after training (based on MRR@10) ===
+    # === Log the best checkpoint info after training (based on MRR@10) ===
+    if dist.is_initialized():
+        dist.barrier()  # make sure all ranks finish before logging
+
+    if args.global_rank == 0:
+        log_message = (
+                "\n" + "=" * 80 + "\n"
+                + "[Training Completed]\n"
+                + "✅ Best checkpoint was found at:\n"
+                + f"   ➤ Epoch: {best_epoch + 1}\n"
+                + f"   ➤ Global Step: {best_step}\n"
+                + f"   ➤ Best MRR@10: {best_eval_metric:.6f}\n"
+                + f"   ➤ Path: {os.path.join(args.output_dir, f'checkpoint-epoch-{best_epoch + 1}')}\n"
+                + "=" * 80 + "\n"
         )
 
-    print("Training loop finished.")
+        print(log_message)
+        logging.info(log_message)
 
+        # # Append to training log file only once (no duplicates)
+        # with open(args.training_log, "a") as log_f:
+        #     log_f.write(log_message)
 
 
 if __name__ == '__main__':

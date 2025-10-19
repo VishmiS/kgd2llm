@@ -86,15 +86,26 @@ def generate_features_and_inbatch(
             all_feature_batches.append(pooled_features)
 
             logits = outputs.logits
-            final_logits = logits[:, -1, [yes_id, no_id]].cpu().float().numpy().tolist()
-            all_logits.extend(final_logits)
+            batch_logits = logits[:, -1, [yes_id, no_id]]  # shape: [batch_size, 2]
 
-            batch_logits = logits[:, -1, [yes_id, no_id]].cpu()
+            # Convert to probability using softmax (positive = "Can", negative = "Cannot")
+            probs = torch.softmax(batch_logits.float(), dim=-1)  # shape: [batch_size, 2]
 
+            # Keep as teacher logits (pos = Can, neg = Cannot)
+            pos_probs = probs[:, 0]
+            neg_probs = probs[:, 1]
+
+            # Stack without clamping; softmax ensures 0 < pos_prob < 1
+            processed_logits = torch.stack([pos_probs, neg_probs], dim=-1).cpu()
+
+            # Save final logits
+            all_logits.extend(processed_logits.numpy().tolist())
+
+            # Build in-batch logits
             inbatch_logits = []
-            for i in range(batch_logits.size(0)):
-                others = [j for j in range(batch_logits.size(0)) if j != i]
-                sample_logits = batch_logits[others]
+            for i in range(processed_logits.size(0)):
+                others = [j for j in range(processed_logits.size(0)) if j != i]
+                sample_logits = processed_logits[others]
                 inbatch_logits.append(sample_logits)
 
             inbatch_logits_tensor = torch.stack(inbatch_logits)
@@ -122,22 +133,24 @@ def generate_features_and_inbatch(
 
 
 if __name__ == "__main__":
-    model_dir = "gpt2"  # Your English LM, optionally GPT-2 tuned for MS MARCO
-    hardneg_dir = "../outputs/neg_faiss/mmarco_train_neg.pkl"
-    output_logits_pkl_path = "../outputs/logits/mmarco_train_logits.pkl"
-    output_features_pkl_path = "../outputs/features/mmarco_train_features.pkl"
-    output_inbatch_pkl_path = "../outputs/inbatch/mmarco_train_inbatch.pkl"
-
-    task_type = "context"
+    # ==== Common configuration ====
+    model_dir = "gpt2"  # e.g., your teacher LM
     batch_size = 16
     teacher_max_seq_length = 256
     num_shards = 1
     id_shard = 0
+    task_type = "context"
 
-    print("Generating logits, features, and in-batch logits for MS MARCO hard negatives...")
-    generated_logits, features_list, inbatch_dict = generate_features_and_inbatch(
+    # ==== Train ====
+    print("=== Generating logits/features/in-batch for TRAIN ===")
+    hardneg_dir_train = "../outputs/neg_faiss/mmarco_train_neg.pkl"
+    output_logits_train = "../outputs/logits/mmarco_train_logits.pkl"
+    output_features_train = "../outputs/features/mmarco_train_features.pkl"
+    output_inbatch_train = "../outputs/inbatch/mmarco_train_inbatch.pkl"
+
+    generated_logits_train, features_train, inbatch_train = generate_features_and_inbatch(
         model_dir=model_dir,
-        neg_pkl_file=hardneg_dir,
+        neg_pkl_file=hardneg_dir_train,
         task_type=task_type,
         bs=batch_size,
         teacher_max_seq_length=teacher_max_seq_length,
@@ -145,11 +158,30 @@ if __name__ == "__main__":
         id_shard=id_shard,
     )
 
-    write_pickle(generated_logits, output_logits_pkl_path)
-    print(f"Saved logits to {output_logits_pkl_path}")
+    write_pickle(generated_logits_train, output_logits_train)
+    write_pickle({f"global_rank{id_shard}": features_train}, output_features_train)
+    write_pickle({f"global_rank{id_shard}": inbatch_train}, output_inbatch_train)
+    print(f"Saved TRAIN logits/features/inbatch to {output_logits_train}")
 
-    write_pickle({f"global_rank{id_shard}": features_list}, output_features_pkl_path)
-    print(f"Saved features to {output_features_pkl_path}")
+    # ==== Validation ====
+    print("\n=== Generating logits/features/in-batch for VAL ===")
+    hardneg_dir_val = "../outputs/neg_faiss/mmarco_val_neg.pkl"
+    output_logits_val = "../outputs/logits/mmarco_val_logits.pkl"
+    output_features_val = "../outputs/features/mmarco_val_features.pkl"
+    output_inbatch_val = "../outputs/inbatch/mmarco_val_inbatch.pkl"
 
-    write_pickle(inbatch_dict, output_inbatch_pkl_path)
-    print(f"Saved in-batch similarities to {output_inbatch_pkl_path}")
+    generated_logits_val, features_val, inbatch_val = generate_features_and_inbatch(
+        model_dir=model_dir,
+        neg_pkl_file=hardneg_dir_val,
+        task_type=task_type,
+        bs=batch_size,
+        teacher_max_seq_length=teacher_max_seq_length,
+        num_shards=num_shards,
+        id_shard=id_shard,
+    )
+
+    write_pickle(generated_logits_val, output_logits_val)
+    write_pickle({f"global_rank{id_shard}": features_val}, output_features_val)
+    write_pickle({f"global_rank{id_shard}": inbatch_val}, output_inbatch_val)
+    print(f"Saved VAL logits/features/inbatch to {output_logits_val}")
+

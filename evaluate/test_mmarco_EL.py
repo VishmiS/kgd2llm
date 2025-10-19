@@ -4,21 +4,19 @@
 
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import torch
 import faiss
 from argparse import Namespace
 from collections import defaultdict
 from model.pro_model import Mymodel
 from tqdm import tqdm
-from entity_linking.pipeline import enrich_query_with_entities_and_facts, print_clean_pipeline_result
-import pickle
-import time
 import hashlib
 import random, numpy as np, torch
 import pandas as pd
-from langdetect import detect
 import re
-
+from langdetect import detect
+from entity_linking.pipeline import enrich_query_with_entities_and_facts, print_clean_pipeline_result
+import pickle
+import time
 
 # Paths
 MODEL_PATH = "/root/pycharm_semanticsearch/PATH_TO_OUTPUT_MODEL/mmarco/final_student_model_fp32"
@@ -27,7 +25,7 @@ CORPUS_FILE  = "/root/pycharm_semanticsearch/dataset/ms_marco/val/corpus.tsv"
 QRELS_FILE   = "/root/pycharm_semanticsearch/dataset/ms_marco/val/qrels.tsv"
 
 # Settings
-MAX_QUERIES = 59273 # 59273       process all queries
+MAX_QUERIES = 100 # 101093       process all queries
 MAX_CORPUS_DOCS = 1008986 # 1008986     limit corpus documents for testing
 RECALL_K = 10
 BATCH_SIZE = 16
@@ -96,7 +94,6 @@ def compute_hash(model_path, corpus_file, max_docs, batch_size):
     info = f"{model_path}-{corpus_file}-{max_docs}-{batch_size}"
     return hashlib.md5(info.encode()).hexdigest()
 
-
 def encode_corpus(model, corpus, batch_size=BATCH_SIZE, force_rebuild=False):
     """
     Encode corpus embeddings and save to disk for reuse.
@@ -134,7 +131,7 @@ def encode_corpus(model, corpus, batch_size=BATCH_SIZE, force_rebuild=False):
     faiss.normalize_L2(corpus_embs_np)
     torch.save({"ids": corpus_ids, "embs": torch.from_numpy(corpus_embs_np)}, cache_file)
 
-    print(f"[INFO] Saved new cache: {cache_file}")
+    print(f"[INFO] Saved normalized corpus embeddings to {cache_file}")
     return corpus_ids, torch.from_numpy(corpus_embs_np).to(device)
 
 
@@ -170,6 +167,11 @@ def evaluate_mmarco():
     queries = load_queries(MAX_QUERIES)
     corpus = load_corpus(MAX_CORPUS_DOCS)
     qrels = load_qrels()
+
+    # 🔹 Filter queries to include only those that have at least one relevant doc
+    queries = {qid: qtext for qid, qtext in queries.items() if qid in qrels}
+
+    print(f"[INFO] Filtered queries to only those with qrels. Total unique queries with answers: {len(queries)}")
 
     model = Mymodel(model_name_or_path=MODEL_PATH, args=args)
     model.eval().to(device)
@@ -302,10 +304,7 @@ def evaluate_mmarco():
                 "count_entities": len(all_entities),
                 "count_simple_entities": count_simple_entities,
                 "count_complex_entities": count_complex_entities,
-
-                # ✅ add this line
                 "dbpedia_entities": dbpedia_entities,
-
                 "entities_source": {
                     "wikidata_names": list(all_entities.values()),
                     "wikidata_qids": list(all_entities.keys()),
@@ -325,7 +324,7 @@ def evaluate_mmarco():
 
             })
 
-            time.sleep(1) # if you want the pause
+            time.sleep(3) # if you want the pause
     else:
         # Load from cache
         with open(ENRICHED_QUERIES_CACHE, "rb") as f:
@@ -359,9 +358,6 @@ def evaluate_mmarco():
         # print("relation_entity_mapping field:", enriched.get("relation_entity_mapping"))
         # print("==============================\n")
 
-        # ---------------- RELATION + FACT SUMMARIES ----------------
-        falcon_relations = enriched.get("falcon_relations", {})
-        relation_mapping = enriched.get("relation_entity_mapping", {})
 
         # ---------------- RELATION + FACT SUMMARIES ----------------
         falcon_relations = enriched.get("falcon_relations", {})
@@ -551,17 +547,6 @@ def evaluate_mmarco():
                 "filtered_facts": dbpedia_facts_filtered_str
             })
 
-    # --- Save both sheets into one Excel file ---
-    queries_df = pd.DataFrame(query_rows)
-    entities_df = pd.DataFrame(entity_rows)
-
-    output_path = "entity_linking_results.xlsx"
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        queries_df.to_excel(writer, index=False, sheet_name="queries")
-        entities_df.to_excel(writer, index=False, sheet_name="entities")
-
-    print(f"[INFO] Saved results to {output_path} with 'queries' and 'entities' sheets.")
-
     with torch.no_grad():
         printed_examples = 0  # counter for printed samples
         for i in range(0, len(query_texts), BATCH_SIZE):
@@ -588,7 +573,30 @@ def evaluate_mmarco():
                 mrr_total += reciprocal_rank
 
                 # Compute Recall@K
-                recall_total += 1 if relevant & set(ranked_doc_ids) else 0
+                recall_flag = 1 if relevant & set(ranked_doc_ids) else 0
+                recall_total += recall_flag
+
+                # 🔹 Find if this query_id already exists in query_rows (from enrichment step)
+                existing_row = next((r for r in query_rows if r["query_id"] == qid), None)
+
+                if existing_row:
+                    # Update the existing enriched record with MRR and Recall
+                    existing_row.update({
+                        "relevant_doc_ids": list(relevant),
+                        f"top_{RECALL_K}_doc_ids": ranked_doc_ids[:RECALL_K],
+                        "MRR": reciprocal_rank,
+                        f"Recall@{RECALL_K}": recall_flag
+                    })
+                else:
+                    # Fallback in case query_id wasn't enriched (shouldn't normally happen)
+                    query_rows.append({
+                        "query_id": qid,
+                        "original_query": queries[qid],
+                        "relevant_doc_ids": list(relevant),
+                        f"top_{RECALL_K}_doc_ids": ranked_doc_ids[:RECALL_K],
+                        "MRR": reciprocal_rank,
+                        f"Recall@{RECALL_K}": recall_flag
+                    })
 
                 # Print output only for the first 3 examples
                 if printed_examples < 3:
@@ -616,12 +624,15 @@ def evaluate_mmarco():
         f.write(f"Total queries evaluated: {num_eval}\n")
         f.write(f"Average MRR: {avg_mrr:.4f}\n")
         f.write(f"Recall@{RECALL_K}: {avg_recall:.2%}\n")
-        f.write("\n==== Per-query Results (first 50 shown) ====\n")
 
-        # Optionally, log per-query MRR values if you track them
-        # You can add a list to store per-query metrics inside the loop above
-        # For now, we'll just store the last 50 printed ones
-        f.write("(Add per-query details here if needed)\n")
+    queries_df = pd.DataFrame(query_rows)
+    entities_df = pd.DataFrame(entity_rows)
+
+    output_path = "entity_linking_results.xlsx"
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        queries_df.to_excel(writer, index=False, sheet_name="queries")
+        entities_df.to_excel(writer, index=False, sheet_name="entities")
+
 
     print(f"[INFO] Results saved to {results_file}")
 

@@ -17,76 +17,81 @@ def check_tensor(name, tensor):
         print(f"[LARGE VALUE DETECTED] in {name}, max: {tensor.abs().max().item()}")
 
 
-def cal_loss_in_batch(args, student_logits, temperature, criterion):
+def cal_loss_in_batch(args, student_logits, temperature, criterion=None):
+    """
+    Standard in-batch contrastive loss: cross-entropy over candidates.
+    student_logits: [bs, num_candidates]
+    """
     bs = student_logits.size(0)
-    logits = student_logits / temperature
-    labels = torch.arange(bs, device=logits.device)
+    logits = student_logits / (temperature + 1e-12)
+    labels = torch.zeros(bs, dtype=torch.long, device=logits.device)  # positive at idx 0
 
-    loss_bs = criterion(logits, labels)
-    loss = loss_bs.sum() / (bs * bs)
-
+    # Use functional cross_entropy directly for stability
+    loss = F.cross_entropy(logits, labels, reduction='mean')
     return loss
 
 
 def cal_loss_hardneg(args, teacher_logits, student_logits, temperature_teacher, temperature, nll_criterion):
+    """
+    Hard negative loss between student and teacher.
+    - teacher_logits: [bs, num_candidates, 2]
+    - student_logits: [bs, num_candidates]
+    - Uses teacher first channel for weighting and adjusts hard negatives.
+    """
     loss_hardneg_weight = args.alpha
+    bs = teacher_logits.size(0)
+    num_candidates = teacher_logits.size(1)
+    neg_K = num_candidates - 1
 
     if temperature_teacher <= 0:
         raise ValueError("temperature_teacher must be > 0!")
 
-    def softmax(X, temp):
-        return torch.nn.functional.softmax(X / temp, dim=-1)
+    # Softmax over candidates for teacher
+    teacher_probs = torch.nn.functional.softmax(teacher_logits / temperature_teacher, dim=1)
 
-    bs = teacher_logits.size(0)
-    neg_K = teacher_logits.size(1) - 1
+    # Take first channel (positive/primary score) for weighting
+    teacher_probs_first = teacher_probs[..., 0]  # [bs, num_candidates]
 
-    teacher_logits_clamped = torch.clamp(teacher_logits, min=-20, max=20)
-    teacher_soft_full = softmax(teacher_logits_clamped, temperature_teacher)
+    # Adjust hard negatives: invert teacher probability for all negatives except positive
+    if neg_K > 0:
+        teacher_probs_first[:, 1:] = 1.0 - teacher_probs_first[:, 1:]
 
-    teacher_soft = teacher_soft_full[..., 0]
+    # Multiply student logits by teacher weights
+    weighted_student_logits = student_logits * teacher_probs_first  # [bs, num_candidates]
 
-    teacher_logits_weights = teacher_soft.clone()
-    if teacher_logits_weights.size(1) > 1:
-        teacher_logits_weights[:, 1:] = 1 - teacher_logits_weights[:, 1:]
+    # Softmax + log for NLL
+    student_log_probs = torch.nn.functional.log_softmax(weighted_student_logits / temperature, dim=-1)
 
-    weighted_logits = student_logits * teacher_logits_weights
-    softmax_weighted = softmax(weighted_logits, temperature)
-
-    inputs = torch.clamp(softmax_weighted, min=1e-8).log()
-
+    # Labels: all positives are at index 0
     labels = torch.zeros(bs, dtype=torch.long, device=student_logits.device)
 
-    loss_bs = nll_criterion(inputs, labels)
+    # Compute NLL loss
+    loss_bs = nll_criterion(student_log_probs, labels)
+
+    # Apply weight
+    # Apply weight per-sample (do NOT detach)
     loss_bs = loss_bs * loss_hardneg_weight
 
-    return loss_bs.sum() / (bs * neg_K)
+    # Reduce by mean to maintain gradient flow
+    loss_bs = loss_bs.mean()
+    return loss_bs
 
 
 def cal_loss_rd(args, teacher_logits, student_logits, teacher_temperature):
     loss_pearson_weight = args.beta
 
-    # Softmax with temperature (using PyTorch's F.softmax for clarity and stability)
-    teacher_probs = F.softmax(teacher_logits / teacher_temperature, dim=-1)[:, :, 0]
+    # Ensure same dtype as model (bf16)
+    dtype = student_logits.dtype
 
-    # Pearson correlation function (batch-wise)
-    def pearsonr(x, y, dim=-1):
-        vx = x - x.mean(dim=dim, keepdim=True)
-        vy = y - y.mean(dim=dim, keepdim=True)
-        cov = (vx * vy).sum(dim=dim, keepdim=True) / (x.size(dim) - 1)
-        std_x = x.std(dim=dim, keepdim=True)
-        std_y = y.std(dim=dim, keepdim=True)
-        corr = cov / (std_x * std_y + 1e-8)
-        return corr.squeeze(dim)
+    teacher_probs = F.softmax(teacher_logits / teacher_temperature, dim=-1)[..., 0].to(dtype)
+    student_probs = F.softmax(student_logits / teacher_temperature, dim=-1).to(dtype)
 
-    # Calculate correlation per sample in batch
-    spearson = pearsonr(student_logits, teacher_probs, dim=-1)
+    teacher_probs = torch.clamp(teacher_probs, 1e-8, 1.0)
+    student_probs = torch.clamp(student_probs, 1e-8, 1.0)
 
-    loss_bs = 1 - spearson
 
-    loss_bs = loss_bs * loss_pearson_weight
-
-    # Average loss over batch
-    return loss_bs.mean()
+    loss = F.mse_loss(student_probs, teacher_probs) * loss_pearson_weight
+    return loss
 
 
 def cal_loss_rd2(args, teacher_logits_pos_hardneg, teacher_logits_pos_inbatch, teacher_temperature,
@@ -126,8 +131,7 @@ def cal_loss_rd2(args, teacher_logits_pos_hardneg, teacher_logits_pos_inbatch, t
     # print(f"[DEBUG] expanded_inbatch.shape: {expanded_inbatch.shape}")
 
     diff = expanded_hardneg - expanded_inbatch
-    sigmoid_diff = sigmoid(diff) + 1e-8
-    log_sigmoid_diff = sigmoid_diff.log()
+    log_sigmoid_diff = F.logsigmoid(diff)
 
     # print(f"[DEBUG] diff: min={diff.min().item()}, max={diff.max().item()}, mean={diff.mean().item()}")
     # print(f"[DEBUG] sigmoid_diff: min={sigmoid_diff.min().item()}, max={sigmoid_diff.max().item()}, mean={sigmoid_diff.mean().item()}")
@@ -143,10 +147,13 @@ def cal_loss_rd2(args, teacher_logits_pos_hardneg, teacher_logits_pos_inbatch, t
     weight_hardneg_inbatch = teacher_logits_hardneg.repeat_interleave(inbatch, dim=1) - teacher_logits_inbatch.repeat((1, neg_K))
     weight_hardneg_inbatch = torch.clamp(weight_hardneg_inbatch, min=0) / safe_scale_param
 
-    loss_bs = (loss_hardneg_inbatch * weight_hardneg_inbatch).sum(-1)
+    # Weighted per-sample loss
+    loss_bs = (loss_hardneg_inbatch * weight_hardneg_inbatch).sum(-1)  # sum over candidates
     loss_bs = loss_bs * loss_bpr_weight
 
-    return loss_bs.sum() / (bs * neg_K * inbatch)
+    # Take mean over batch for proper gradient flow
+    loss_bs = loss_bs.mean()
+    return loss_bs
 
 
 def cal_feat_loss(args, teacher_feat_cos, student_feature_pos_hardneg):

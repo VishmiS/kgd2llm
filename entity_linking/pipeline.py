@@ -140,10 +140,29 @@ def query_wikidata_facts(qid):
     """
     headers = {"Accept": "application/sparql-results+json"}
     response = requests.get(WIKIDATA_SPARQL_ENDPOINT, params={"query": query}, headers=headers)
+
+    # Handle rate limit
     if response.status_code == 429:
-        time.sleep(1)  # wait a second
+        print(f"[WARN] 429 Too Many Requests for {qid}, retrying after 1s...")
+        time.sleep(1)
         response = requests.get(WIKIDATA_SPARQL_ENDPOINT, params={"query": query}, headers=headers)
-    results = response.json().get('results', {}).get('bindings', [])
+
+    # --- SAFE JSON HANDLING PATCH START ---
+    if not response.ok:
+        print(f"[WARN] Wikidata HTTP error {response.status_code} for {qid}")
+        print("Response text (first 200 chars):", response.text[:200])
+        return []
+
+    try:
+        data = response.json()
+    except Exception as e:
+        print(f"[WARN] Failed to parse JSON for {qid}: {e}")
+        print(f"Status: {response.status_code}")
+        print("Raw response (first 200 chars):", response.text[:200])
+        return []
+    # --- SAFE JSON HANDLING PATCH END ---
+
+    results = data.get('results', {}).get('bindings', [])
     facts = []
     for result in results:
         prop = result.get('propertyLabel', {}).get('value')
@@ -151,6 +170,7 @@ def query_wikidata_facts(qid):
         if prop and val:
             facts.append((prop, val))
     return facts
+
 
 def fetch_entity_types(qid):
     """
@@ -1099,7 +1119,7 @@ def display_full_pipeline_result(result, max_facts_per_entity=10, show_scores=Tr
 # -----------------------------
 # Example Usage
 # # -----------------------------
-# prompt = "why did rachel carson write an obligation to endure"
+# prompt = "water flux meaning"
 # result = enrich_query_with_entities_and_facts(prompt)
 # # print_clean_pipeline_result(result)
 #

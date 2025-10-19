@@ -1,7 +1,7 @@
 import pickle
 
 # 🔧 Set the path to your .pkl file here
-pkl_path = "snli_train_features.pkl"
+pkl_path = "mmarco_train_features.pkl"
 
 def inspect_pickle(pkl_path):
     try:

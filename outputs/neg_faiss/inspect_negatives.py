@@ -16,7 +16,7 @@ def load_pickle(file_path):
         return None
 
 
-def inspect_logits(file_path, label="", neg_K=8):
+def inspect_logits(file_path, label="", neg_K=4):
     """Inspect the structure and some sample data of the logits pickle file."""
     print(f"\nInspecting {label} file: {file_path}")
 
@@ -67,4 +67,4 @@ def inspect_logits(file_path, label="", neg_K=8):
 if __name__ == "__main__":
     # Set your file paths here
     neg_file = "mmarco_train_neg.pkl"
-    inspect_logits(neg_file, label="NEG", neg_K=8)
+    inspect_logits(neg_file, label="NEG", neg_K=4)
