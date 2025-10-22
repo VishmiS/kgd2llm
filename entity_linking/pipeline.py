@@ -4,6 +4,7 @@ import time
 import re
 import json
 from SPARQLWrapper import SPARQLWrapper, JSON
+
 # Load SentenceTransformer model for semantic similarity
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -18,7 +19,6 @@ GENERIC_THRESHOLD = 0.65  # similarity threshold to consider property as generic
 # -----------------------------
 # 1. Falcon Entity Linking
 # -----------------------------
-import requests
 
 def falcon_entity_linking(text):
     """
@@ -298,22 +298,6 @@ def get_best_entity_match(surface_form, candidates):
             best_candidate = c
     return best_candidate
 
-# -----------------------------
-# 4. Semantic Filtering
-# -----------------------------
-def filter_facts_semantically(question, facts, threshold=0.2):
-    question_emb = embedding_model.encode(question, convert_to_tensor=True)
-    filtered = []
-
-    for prop, val in facts:
-        prop_emb = embedding_model.encode(prop, convert_to_tensor=True)
-        similarity = util.cos_sim(question_emb, prop_emb).item()
-
-        if similarity >= threshold:
-            filtered.append((prop, val))
-
-    return filtered
-
 
 def convert_facts_to_sentences_auto(entity_label, facts, entity_types=None, context_question=None):
     """
@@ -355,22 +339,38 @@ def convert_facts_to_sentences_auto(entity_label, facts, entity_types=None, cont
     return sentences
 
 
-
-def filter_facts_semantically_and_relevant_auto(question, facts, question_entities=None, top_k_per_entity=5):
+def filter_facts_semantically_and_relevant_auto(
+    question: str,
+    facts: list,
+    question_entities: list = None,
+    top_k_per_entity: int = 5,
+    threshold: float = 0.2
+):
     """
-    Enhanced semantic filtering:
-    - Uses entity-aware similarity
-    - Weights value higher for generic properties
-    - Ranks facts instead of strict thresholding
-    - Keeps top-k most relevant facts per entity
+    Filters and ranks (property, value) facts based on semantic similarity
+    to a given natural language question, with synonym expansion and
+    contextual relevance boosting.
     """
     if not facts:
         return []
 
-    # Encode question
-    question_emb = embedding_model.encode(question, convert_to_tensor=True)
+    # --- 1️⃣ Expand the question with semantic synonyms ---
+    synonyms = {
+        "where": ["place", "location", "city", "birthplace", "country", "origin"],
+        "who": ["person", "individual", "human", "biography"],
+        "when": ["date", "time", "year", "birthdate", "foundation"],
+        "from": ["born in", "origin", "place of birth", "birthplace"]
+    }
+    expanded = [question]
+    for key, vals in synonyms.items():
+        if key in question.lower():
+            expanded.extend(vals)
+    expanded_question = " ".join(expanded)
 
-    # Encode question entities if provided
+    # --- 2️⃣ Encode question ---
+    question_emb = embedding_model.encode(expanded_question, convert_to_tensor=True)
+
+    # --- 3️⃣ Encode entities if provided ---
     entity_embeddings = []
     if question_entities:
         for ent in question_entities:
@@ -379,6 +379,7 @@ def filter_facts_semantically_and_relevant_auto(question, facts, question_entiti
 
     scored_facts = []
 
+    # --- 4️⃣ Score each fact ---
     for prop, val in facts:
         if not prop or not val:
             continue
@@ -391,32 +392,43 @@ def filter_facts_semantically_and_relevant_auto(question, facts, question_entiti
         prop_emb = embedding_model.encode(prop, convert_to_tensor=True)
         val_emb = embedding_model.encode(val, convert_to_tensor=True)
 
-        # Base similarity to question
+        # Compute base similarities
         prop_sim = util.cos_sim(question_emb, prop_emb).item()
         val_sim = util.cos_sim(question_emb, val_emb).item()
 
-        # Adjust weights dynamically for generic properties using semantic similarity
-        prop_similarity_to_generic = util.cos_sim(prop_emb, generic_proto_emb).item()
-        if prop_similarity_to_generic >= GENERIC_THRESHOLD:
+        # --- 5️⃣ Adjust dynamic weighting ---
+        prop_similarity_to_generic = 0.0
+        if 'generic_proto_emb' in globals():
+            prop_similarity_to_generic = util.cos_sim(prop_emb, generic_proto_emb).item()
+
+        if prop_similarity_to_generic >= 0.6:
             sim = 0.2 * prop_sim + 0.8 * val_sim
         else:
             sim = 0.6 * prop_sim + 0.4 * val_sim
 
-        # Boost based on entity relevance
+        # --- 6️⃣ Add entity relevance boost ---
         entity_sim_boost = 0
         for ent_emb in entity_embeddings:
             entity_sim_boost = max(entity_sim_boost, util.cos_sim(val_emb, ent_emb).item())
-        sim += 0.1 * entity_sim_boost  # small boost for entity-related facts
+        sim += 0.1 * entity_sim_boost
+
+        # --- 7️⃣ Contextual keyword boosting ---
+        keywords = ["birth", "born", "origin", "place", "hometown", "city", "country"]
+        if any(k in prop.lower() for k in keywords):
+            sim += 0.15
+        if "where" in question.lower():
+            sim += 0.1  # stronger boost for location questions
+        if "when" in question.lower() and any(k in prop.lower() for k in ["date", "year", "time", "birthdate"]):
+            sim += 0.1
 
         scored_facts.append((sim, prop, val))
 
-    # Rank facts by score descending
+    # --- 8️⃣ Rank and threshold ---
     scored_facts.sort(reverse=True, key=lambda x: x[0])
+    filtered = [(prop, val) for sim, prop, val in scored_facts if sim >= threshold]
 
-    # Return top-k facts
-    filtered = [(prop, val) for score, prop, val in scored_facts[:top_k_per_entity]]
-
-    return filtered
+    # --- 9️⃣ Limit per entity ---
+    return filtered[:top_k_per_entity]
 
 
 def correct_entity_labels(entities_dict):
@@ -594,11 +606,6 @@ def merge_and_clean_entities(falcon_entities, spotlight_entities):
     return clean
 
 def get_entity_facts(qid, property_filter=None, limit=50):
-    """
-    Query Wikidata for specific property facts of an entity (optionally filtered by property).
-    Returns a list of dicts like:
-      {"property": "product", "value": "Windows 11", "pid": "P1056"}
-    """
     endpoint = "https://query.wikidata.org/sparql"
     sparql = SPARQLWrapper(endpoint)
     sparql.setReturnFormat(JSON)
@@ -637,10 +644,6 @@ def get_entity_facts(qid, property_filter=None, limit=50):
     return facts
 
 def run_sparql_query(query, endpoint="https://query.wikidata.org/sparql"):
-    """
-    Executes a SPARQL query against Wikidata and returns JSON results as a list of dicts.
-    Handles rate limits (429) gracefully.
-    """
     headers = {
         "Accept": "application/sparql-results+json",
         "User-Agent": "EntityLinkingPipeline/1.0 (https://example.org)"
@@ -812,7 +815,7 @@ def enrich_query_with_entities_and_facts(original_text):
                     qid_facts_combined.setdefault(qid, []).extend(rel_specific)
 
     # ------------------- Reformulated Query -------------------
-    def rank_sentences_by_similarity(question, sentences, min_score=0.45):
+    def rank_sentences_by_similarity(question, sentences, min_score=0.65):
         q_emb = embedding_model.encode(question, convert_to_tensor=True)
         scored = [(util.cos_sim(q_emb, embedding_model.encode(s, convert_to_tensor=True)).item(), s)
                   for s in sentences]
@@ -828,7 +831,7 @@ def enrich_query_with_entities_and_facts(original_text):
     ranked_expanded = [(util.cos_sim(q_emb, embedding_model.encode(s, convert_to_tensor=True)).item(), s)
                        for s in expanded_sentences]
     ranked_expanded = [s for score, s in sorted(ranked_expanded, reverse=True) if score >= 0.5]
-    top_sentences = ranked_expanded[:5]
+    top_sentences = ranked_expanded[:1]
 
     reformulated_query = f"{original_text} {' '.join(top_sentences)}"
     reformulated_query = re.sub(r"\s*\.\s*$", "", reformulated_query.strip())
@@ -926,11 +929,6 @@ def print_clean_pipeline_result(result, max_facts_per_entity=5):
 
 
 def display_full_pipeline_result(result, max_facts_per_entity=10, show_scores=True):
-    """
-    Deep diagnostic display.
-    Shows detailed provenance, property IDs, scores, SPARQL URLs,
-    and how relations (e.g. 'products') are applied to entities.
-    """
 
     # === Core Display Utilities ===
     def print_entities():
@@ -1119,9 +1117,9 @@ def display_full_pipeline_result(result, max_facts_per_entity=10, show_scores=Tr
 # -----------------------------
 # Example Usage
 # # -----------------------------
-# prompt = "water flux meaning"
-# result = enrich_query_with_entities_and_facts(prompt)
-# # print_clean_pipeline_result(result)
+prompt = "who is moira en x men?"
+result = enrich_query_with_entities_and_facts(prompt)
+# print_clean_pipeline_result(result)
 #
-# display_full_pipeline_result(result,1)
+display_full_pipeline_result(result,1)
 
