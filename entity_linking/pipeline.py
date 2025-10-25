@@ -3,8 +3,11 @@ from sentence_transformers import SentenceTransformer, util
 import time
 import re
 import json
+import requests
 from SPARQLWrapper import SPARQLWrapper, JSON
-
+from entity_linking.view_results import display_full_pipeline_result
+from entity_linking.decompose_phrase import resolve_composite_entity
+from entity_linking.entity_linking_utils import falcon_entity_linking, dbpedia_entity_linking, merge_and_clean_entities, correct_entity_labels, wikidata_entities, fetch_entity_types, process_facts, query_wikidata_facts, query_2hop_facts, query_dbpedia_facts, query_dbpedia_2hop_facts, process_dbpedia_facts_semantic,run_sparql_query, get_entity_facts
 # Load SentenceTransformer model for semantic similarity
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -15,659 +18,115 @@ DBPEDIA_SPARQL_ENDPOINT = "https://dbpedia.org/sparql"
 generic_proto_emb = embedding_model.encode("general topic or category", convert_to_tensor=True)
 GENERIC_THRESHOLD = 0.65  # similarity threshold to consider property as generic
 
-
-# -----------------------------
-# 1. Falcon Entity Linking
-# -----------------------------
-
-def falcon_entity_linking(text):
+# --- New helper: try to extract direct location/answer from filtered facts ---
+def find_direct_answer_from_facts(question_text, wikidata_filtered_facts, dbpedia_filtered_facts):
     """
-    Use Falcon 2.0 API to detect and link entities and relations from the input text.
-    Returns four dictionaries:
-      - wikidata_entities: {QID: surface_form}
-      - dbpedia_entities: {DBpedia_URI: surface_form}
-      - wikidata_relations: {PID: surface_form}
-      - dbpedia_relations: {DBpedia_URI: surface_form}
+    Extracts direct answers (date/time for 'when', people for 'who', occupation/type for 'what')
+    from filtered Wikidata and DBpedia facts.
+    Works for both dict and list-of-tuples fact formats.
     """
-    url = "https://labs.tib.eu/falcon/falcon2/api?mode=long"
-    payload = {"text": text}
-
-    try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        result = response.json()
-
-        # Extract entity info
-        entities_wd = result.get("entities_wikidata", [])
-        entities_db = result.get("entities_dbpedia", [])
-
-        wikidata_entities = {
-            e["URI"].split("/")[-1]: e.get("surface form", "")
-            for e in entities_wd if "URI" in e
-        }
-        dbpedia_entities = {
-            e["URI"]: e.get("surface form", "")
-            for e in entities_db if "URI" in e
-        }
-
-        # Extract relation info
-        relations_wd = result.get("relations_wikidata", [])
-        relations_db = result.get("relations_dbpedia", [])
-
-        wikidata_relations = {
-            r["URI"].split("/")[-1]: r.get("surface form", "")
-            for r in relations_wd if "URI" in r
-        }
-        dbpedia_relations = {
-            r["URI"]: r.get("surface form", "")
-            for r in relations_db if "URI" in r
-        }
-        print(wikidata_entities, dbpedia_entities, wikidata_relations, dbpedia_relations)
-        return wikidata_entities, dbpedia_entities, wikidata_relations, dbpedia_relations
-
-    except requests.exceptions.RequestException as e:
-        print(f"[Falcon] Request error: {e}")
-        return {}, {}, {}, {}
-    except ValueError:
-        print("[Falcon] Response parsing error")
-        return {}, {}, {}, {}
-
-
-
-
-
-# -----------------------------
-# 2. DBpedia Entity Linking (fallback)
-# -----------------------------
-def dbpedia_entity_linking(text, confidence=0.5, support=20):
-    """
-    Extract DBpedia entities from text using DBpedia Spotlight API.
-    """
-    url = "https://api.dbpedia-spotlight.org/en/annotate"
-    headers = {"Accept": "application/json"}
-    params = {
-        "text": text,
-        "confidence": confidence,
-        "support": support
-    }
-
-    response = requests.get(url, headers=headers, params=params)
-    entities = {}
-    if response.status_code == 200:
-        data = response.json()
-        resources = data.get("Resources", [])
-        for res in resources:
-            uri = res["@URI"]
-            surface_form = res["@surfaceForm"]
-            entities[uri] = surface_form
-    else:
-        print(f"[DBpedia] Error: {response.status_code}")
-    return entities
-
-
-# -----------------------------
-# 3. Wikidata Utilities
-# -----------------------------
-def wikidata_entities(qid):
-    url = f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
-    response = requests.get(url)
-    if response.status_code != 200:
-        return []
-    data = response.json()
-    entity_data = data['entities'].get(qid, {})
-    entities = []
-
-    labels = entity_data.get('labels', {})
-    if 'en' in labels:
-        entities.append(labels['en']['value'])
-
-    alias_data = entity_data.get('entities', {})
-    if 'en' in alias_data:
-        entities.extend([alias['value'] for alias in alias_data['en']])
-
-    return list(set(entities))
-
-
-
-def query_wikidata_facts(qid):
-    query = f"""
-    SELECT ?propertyLabel ?valueLabel WHERE {{
-      wd:{qid} ?p ?value .
-      ?property wikibase:directClaim ?p .
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-    }}
-    LIMIT 50
-    """
-    headers = {"Accept": "application/sparql-results+json"}
-    response = requests.get(WIKIDATA_SPARQL_ENDPOINT, params={"query": query}, headers=headers)
-
-    # Handle rate limit
-    if response.status_code == 429:
-        print(f"[WARN] 429 Too Many Requests for {qid}, retrying after 1s...")
-        time.sleep(1)
-        response = requests.get(WIKIDATA_SPARQL_ENDPOINT, params={"query": query}, headers=headers)
-
-    # --- SAFE JSON HANDLING PATCH START ---
-    if not response.ok:
-        print(f"[WARN] Wikidata HTTP error {response.status_code} for {qid}")
-        print("Response text (first 200 chars):", response.text[:200])
-        return []
-
-    try:
-        data = response.json()
-    except Exception as e:
-        print(f"[WARN] Failed to parse JSON for {qid}: {e}")
-        print(f"Status: {response.status_code}")
-        print("Raw response (first 200 chars):", response.text[:200])
-        return []
-    # --- SAFE JSON HANDLING PATCH END ---
-
-    results = data.get('results', {}).get('bindings', [])
-    facts = []
-    for result in results:
-        prop = result.get('propertyLabel', {}).get('value')
-        val = result.get('valueLabel', {}).get('value')
-        if prop and val:
-            facts.append((prop, val))
-    return facts
-
-
-def fetch_entity_types(qid):
-    """
-    Fetch the 'instance of' and 'occupation' types for a Wikidata entity
-    Returns a list of type labels
-    """
-    query = f"""
-    SELECT ?typeLabel WHERE {{
-      wd:{qid} wdt:P31|wdt:P106 ?type .
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-    }}
-    LIMIT 10
-    """
-    headers = {"Accept": "application/sparql-results+json"}
-    response = requests.get(WIKIDATA_SPARQL_ENDPOINT, params={"query": query}, headers=headers)
-    if response.status_code != 200:
-        return []
-    results = response.json().get('results', {}).get('bindings', [])
-    types = [r['typeLabel']['value'] for r in results if 'typeLabel' in r]
-    return types
-
-
-def query_2hop_facts(qid):
-    query = f"""
-    SELECT ?pLabel ?oLabel ?p2Label ?o2Label WHERE {{
-      wd:{qid} ?p1 ?o .
-      ?p wikibase:directClaim ?p1 .
-      OPTIONAL {{ ?o ?p2 ?o2 .
-                 ?p2 rdfs:label ?p2Label . FILTER (lang(?p2Label) = "en")
-                 ?o2 rdfs:label ?o2Label . FILTER (lang(?o2Label) = "en") }}
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-    }}
-    LIMIT 50
-    """
-    headers = {"Accept": "application/sparql-results+json"}
-    response = requests.get(WIKIDATA_SPARQL_ENDPOINT, params={"query": query}, headers=headers)
-    if response.status_code != 200:
-        print(f"[SPARQL] 2-hop Query failed for {qid} with status {response.status_code}")
-        return []
-
-    results = response.json().get('results', {}).get('bindings', [])
-    facts = []
-    for result in results:
-        prop = result.get('pLabel', {}).get('value')
-        val = result.get('oLabel', {}).get('value')
-        prop2 = result.get('p2Label', {}).get('value')
-        val2 = result.get('o2Label', {}).get('value')
-        if prop and val:
-            facts.append((prop, val))
-        if prop2 and val2:
-            facts.append((prop2, val2))
-    return facts
-
-
-def query_dbpedia_facts(uri):
-    """
-    Query DBpedia 1-hop facts for a given entity URI.
-    """
-    query = f"""
-    SELECT ?property ?value WHERE {{
-        <{uri}> ?property ?value .
-        FILTER (lang(?value) = 'en' || datatype(?value) = xsd:string)
-    }}
-    LIMIT 50
-    """
-    headers = {"Accept": "application/sparql-results+json"}
-    response = requests.get(DBPEDIA_SPARQL_ENDPOINT, params={"query": query}, headers=headers)
-    if response.status_code != 200:
-        print(f"[DBpedia SPARQL] Query failed for {uri} with status {response.status_code}")
-        return []
-
-    results = response.json().get('results', {}).get('bindings', [])
-    facts = []
-    for result in results:
-        prop = result.get('property', {}).get('value', '').split('/')[-1]
-        val = result.get('value', {}).get('value', '')
-        if prop and val:
-            facts.append((prop, val))
-    return facts
-
-
-def query_dbpedia_2hop_facts(uri):
-    """
-    Query DBpedia 2-hop facts for a given entity URI.
-    """
-    query = f"""
-    SELECT ?p1 ?o1 ?p2 ?o2 WHERE {{
-        <{uri}> ?p1 ?o1 .
-        OPTIONAL {{ ?o1 ?p2 ?o2 }}
-    }}
-    LIMIT 50
-    """
-    headers = {"Accept": "application/sparql-results+json"}
-    response = requests.get(DBPEDIA_SPARQL_ENDPOINT, params={"query": query}, headers=headers)
-    if response.status_code != 200:
-        print(f"[DBpedia SPARQL] 2-hop Query failed for {uri} with status {response.status_code}")
-        return []
-
-    results = response.json().get('results', {}).get('bindings', [])
-    facts = []
-    for result in results:
-        p1 = result.get('p1', {}).get('value', '').split('/')[-1]
-        o1 = result.get('o1', {}).get('value', '')
-        p2 = result.get('p2', {}).get('value', '').split('/')[-1]
-        o2 = result.get('o2', {}).get('value', '')
-        if p1 and o1:
-            facts.append((p1, o1))
-        if p2 and o2:
-            facts.append((p2, o2))
-    return facts
-
-
-def get_best_entity_match(surface_form, candidates):
-    """
-    Choose the best matching candidate entity based on semantic similarity
-    """
-    surface_emb = embedding_model.encode(surface_form, convert_to_tensor=True)
-    best_score = -1
-    best_candidate = None
-    for c in candidates:
-        c_emb = embedding_model.encode(c, convert_to_tensor=True)
-        score = util.cos_sim(surface_emb, c_emb).item()
-        if score > best_score:
-            best_score = score
-            best_candidate = c
-    return best_candidate
-
-
-def convert_facts_to_sentences_auto(entity_label, facts, entity_types=None, context_question=None):
-    """
-    Converts facts to natural sentences without manual keywords.
-    Uses semantic similarity to decide phrasing.
-    """
-    sentences = []
-    entity_label_clean = entity_label.strip().rstrip(".")
-
-    # Optional: encode context question to guide phrasing
-    context_emb = None
-    if context_question:
-        context_emb = embedding_model.encode(context_question, convert_to_tensor=True)
-
-    for prop, val in facts:
-        prop_text = prop.strip()
-        val_text = val.strip()
-
-        # Base sentence
-        sentence = f"{entity_label_clean}'s {prop_text} is {val_text}."
-
-        # Enhance sentence if context provided
-        if context_emb:
-            # Encode prop + val
-            prop_emb = embedding_model.encode(prop_text, convert_to_tensor=True)
-            val_emb = embedding_model.encode(val_text, convert_to_tensor=True)
-
-            # Similarity to context
-            prop_sim = util.cos_sim(context_emb, prop_emb).item()
-            val_sim = util.cos_sim(context_emb, val_emb).item()
-            combined_sim = 0.6 * prop_sim + 0.4 * val_sim
-
-            # If highly relevant, rephrase as "had impact/influence"
-            if combined_sim > 0.6:
-                sentence = f"{entity_label_clean} is related to {val_text} ({prop_text})."
-
-        sentences.append(sentence)
-
-    return sentences
-
-
-def filter_facts_semantically_and_relevant_auto(
-    question: str,
-    facts: list,
-    question_entities: list = None,
-    top_k_per_entity: int = 5,
-    threshold: float = 0.2
-):
-    """
-    Filters and ranks (property, value) facts based on semantic similarity
-    to a given natural language question, with synonym expansion and
-    contextual relevance boosting.
-    """
-    if not facts:
-        return []
-
-    # --- 1️⃣ Expand the question with semantic synonyms ---
-    synonyms = {
-        "where": ["place", "location", "city", "birthplace", "country", "origin"],
-        "who": ["person", "individual", "human", "biography"],
-        "when": ["date", "time", "year", "birthdate", "foundation"],
-        "from": ["born in", "origin", "place of birth", "birthplace"]
-    }
-    expanded = [question]
-    for key, vals in synonyms.items():
-        if key in question.lower():
-            expanded.extend(vals)
-    expanded_question = " ".join(expanded)
-
-    # --- 2️⃣ Encode question ---
-    question_emb = embedding_model.encode(expanded_question, convert_to_tensor=True)
-
-    # --- 3️⃣ Encode entities if provided ---
-    entity_embeddings = []
-    if question_entities:
-        for ent in question_entities:
-            ent_emb = embedding_model.encode(ent, convert_to_tensor=True)
-            entity_embeddings.append(ent_emb)
-
-    scored_facts = []
-
-    # --- 4️⃣ Score each fact ---
-    for prop, val in facts:
-        if not prop or not val:
-            continue
-
-        # Skip RDF/URL noise
-        if prop.lower().startswith(('rdf', 'schema', 'wiki', 'http')):
-            continue
-
-        # Encode property and value
-        prop_emb = embedding_model.encode(prop, convert_to_tensor=True)
-        val_emb = embedding_model.encode(val, convert_to_tensor=True)
-
-        # Compute base similarities
-        prop_sim = util.cos_sim(question_emb, prop_emb).item()
-        val_sim = util.cos_sim(question_emb, val_emb).item()
-
-        # --- 5️⃣ Adjust dynamic weighting ---
-        prop_similarity_to_generic = 0.0
-        if 'generic_proto_emb' in globals():
-            prop_similarity_to_generic = util.cos_sim(prop_emb, generic_proto_emb).item()
-
-        if prop_similarity_to_generic >= 0.6:
-            sim = 0.2 * prop_sim + 0.8 * val_sim
-        else:
-            sim = 0.6 * prop_sim + 0.4 * val_sim
-
-        # --- 6️⃣ Add entity relevance boost ---
-        entity_sim_boost = 0
-        for ent_emb in entity_embeddings:
-            entity_sim_boost = max(entity_sim_boost, util.cos_sim(val_emb, ent_emb).item())
-        sim += 0.1 * entity_sim_boost
-
-        # --- 7️⃣ Contextual keyword boosting ---
-        keywords = ["birth", "born", "origin", "place", "hometown", "city", "country"]
-        if any(k in prop.lower() for k in keywords):
-            sim += 0.15
-        if "where" in question.lower():
-            sim += 0.1  # stronger boost for location questions
-        if "when" in question.lower() and any(k in prop.lower() for k in ["date", "year", "time", "birthdate"]):
-            sim += 0.1
-
-        scored_facts.append((sim, prop, val))
-
-    # --- 8️⃣ Rank and threshold ---
-    scored_facts.sort(reverse=True, key=lambda x: x[0])
-    filtered = [(prop, val) for sim, prop, val in scored_facts if sim >= threshold]
-
-    # --- 9️⃣ Limit per entity ---
-    return filtered[:top_k_per_entity]
-
-
-def correct_entity_labels(entities_dict):
-    corrected = {}
-    for eid, label in entities_dict.items():
-        aliases = []
-        if eid.startswith('Q'):  # Wikidata
-            aliases = wikidata_entities(eid) + [label]
-        else:  # DBpedia URI
-            aliases = [label]
-        best_label = get_best_entity_match(label, aliases) if aliases else label
-        corrected[eid] = best_label
-    return corrected
-
-
-
-# -----------------------------
-# 5. Main Pipeline (Falcon-only)
-# -----------------------------
-def process_facts(entities, query_func, two_hop_func, label_func=None, question=None, entity_types=None):
-    if entity_types is None:
-        entity_types = {}
-    facts_raw, facts_2hop, facts_combined, facts_filtered, readable_sentences = {}, {}, {}, {}, {}
-
-    for key, label in entities.items():
-        raw = query_func(key)
-        hop2 = two_hop_func(key)
-        combined = list(set(raw + hop2))
-        # Filter out irrelevant or noisy properties and values
-        irrelevant_props = ['rdf', 'label', 'filename', 'footer', 'comment', 'thumbnail', 'seeAlso', 'sameAs']
-        facts = [
-            (p, v) for p, v in combined
-            if all(not p.lower().startswith(irr) for irr in irrelevant_props)
-               and not v.lower().startswith('http')
-               and len(v.strip()) > 1
+    import re
+
+    qlower = question_text.lower()
+
+    # Detect question types
+    is_time_question = any(
+        kw in qlower for kw in [
+            "when", "date", "year", "founded", "established",
+            "premiere", "released", "open", "opening", "first performance"
         ]
+    )
+    is_person_question = any(
+        kw in qlower for kw in [
+            "who", "actor", "actress", "played", "performer",
+            "portrayed", "voiced", "cast", "starring"
+        ]
+    )
+    is_what_question = "what" in qlower or "which" in qlower
 
-        filtered = filter_facts_semantically_and_relevant_auto(
-            question,
-            facts,
-            question_entities=entity_types.get(key, [])
-        ) if question else facts
-        label_to_use = label_func(key) if label_func else label
-        sentences = convert_facts_to_sentences_auto(label_to_use, filtered, entity_types.get(key, []))
+    # --- Helper: clean text values ---
+    def clean_text(val):
+        val = str(val).strip()
+        val = re.sub(r'["\']', '', val)
+        val = re.sub(r"\s*\(.*?\)$", "", val)
+        return val.strip()
 
-        facts_raw[key] = raw
-        facts_2hop[key] = hop2
-        facts_combined[key] = combined
-        facts_filtered[key] = filtered
-        readable_sentences[key] = sentences
+    # --- Date/time extraction logic ---
+    def clean_date(val):
+        val = str(val).strip()
+        val = re.sub(r"T\d{2}:\d{2}:\d{2}Z", "", val)
+        m = re.search(r"\d{4}(-\d{2}-\d{2})?", val)
+        return m.group(0) if m else val
 
-    return facts_raw, facts_2hop, facts_combined, facts_filtered, readable_sentences
+    def extract_date(facts):
+        preferred_time_keywords = [
+            "date", "year", "premiere", "opening", "open", "inception",
+            "founded", "established", "first performance"
+        ]
+        iterator = facts.items() if isinstance(facts, dict) else facts
+        for prop, val in iterator:
+            if any(k in prop.lower() for k in preferred_time_keywords):
+                cleaned = clean_date(val)
+                if cleaned:
+                    return cleaned
+        return None
 
+    # --- Person extraction logic ---
+    def extract_person(facts):
+        preferred_person_keywords = [
+            "performer", "actor", "actress", "cast", "starring",
+            "played by", "portrayed by", "voice actor", "narrator"
+        ]
+        iterator = facts.items() if isinstance(facts, dict) else facts
+        for prop, val in iterator:
+            if any(k in prop.lower() for k in preferred_person_keywords):
+                return clean_text(val)
+        return None
 
-def filter_dbpedia_entities(dbpedia_entities, falcon_labels=None, question=None, threshold=0.5):
-    filtered = {}
-    falcon_labels = [l.lower() for l in falcon_labels] if falcon_labels else []
-    question_emb = embedding_model.encode(question, convert_to_tensor=True) if question else None
+    # --- What-question extraction logic ---
+    def extract_type_or_role(facts):
+        preferred_what_keywords = [
+            "occupation", "profession", "role", "type", "instance of",
+            "category", "genre", "field", "discipline"
+        ]
+        iterator = facts.items() if isinstance(facts, dict) else facts
+        for prop, val in iterator:
+            if any(k in prop.lower() for k in preferred_what_keywords):
+                return clean_text(val)
+        return None
 
-    for uri, label in dbpedia_entities.items():
-        label_clean = label.strip()
-        if len(label_clean) <= 3:
-            continue
-        if any(label_clean.lower() in wd_label for wd_label in falcon_labels):
-            continue
-        # Semantic filter: label must be related to question
-        if question_emb:
-            label_emb = embedding_model.encode(label_clean, convert_to_tensor=True)
-            sim = util.cos_sim(question_emb, label_emb).item()
-            if sim < threshold:
-                continue
-        filtered[uri] = label_clean
-    return filtered
+    # --- Apply extraction logic ---
+    if is_time_question:
+        for _, facts in wikidata_filtered_facts.items():
+            date = extract_date(facts)
+            if date:
+                return date
+        for _, facts in dbpedia_filtered_facts.items():
+            date = extract_date(facts)
+            if date:
+                return date
 
+    if is_person_question:
+        for _, facts in wikidata_filtered_facts.items():
+            person = extract_person(facts)
+            if person:
+                return person
+        for _, facts in dbpedia_filtered_facts.items():
+            person = extract_person(facts)
+            if person:
+                return person
 
+    if is_what_question:
+        for _, facts in wikidata_filtered_facts.items():
+            role = extract_type_or_role(facts)
+            if role:
+                return role
+        for _, facts in dbpedia_filtered_facts.items():
+            role = extract_type_or_role(facts)
+            if role:
+                return role
 
-def process_dbpedia_facts_semantic(dbpedia_entities, question=None, threshold=0.50):
-
-    facts_filtered = {}
-    sentences = {}
-
-    # --- Encode question context ---
-    if question:
-        question_emb = embedding_model.encode(question, convert_to_tensor=True)
-    else:
-        question_emb = None
-
-    # --- Step 1: Semantic entity filtering ---
-    semantic_entities = {}
-    for uri, label in dbpedia_entities.items():
-        label_clean = label.strip()
-        if not label_clean:
-            continue
-
-        if question_emb is not None:
-            label_emb = embedding_model.encode(label_clean, convert_to_tensor=True)
-            sim = util.cos_sim(question_emb, label_emb).item()
-            if sim < threshold:
-                continue
-
-        semantic_entities[uri] = label_clean
-
-    # --- Step 2: Retrieve and semantically filter facts ---
-    for uri, label in semantic_entities.items():
-        raw = query_dbpedia_facts(uri)
-        hop2 = query_dbpedia_2hop_facts(uri)
-        combined = list(set(raw + hop2))
-
-        filtered = []
-        for prop, val in combined:
-            if not prop or not val:
-                continue
-            if prop.lower().startswith(('rdf', 'schema', 'wiki', 'http')):
-                continue
-
-            prop_emb = embedding_model.encode(prop, convert_to_tensor=True)
-            val_emb = embedding_model.encode(val, convert_to_tensor=True)
-
-            prop_sim = util.cos_sim(question_emb, prop_emb).item() if question_emb is not None else 0
-            val_sim = util.cos_sim(question_emb, val_emb).item() if question_emb is not None else 0
-
-            sim = 0.6 * prop_sim + 0.4 * val_sim
-
-            if sim >= threshold:
-                filtered.append((prop, val))
-
-        facts_filtered[uri] = filtered
-
-        # --- Step 3: Convert filtered facts to natural sentences ---
-        entity_label_clean = label.strip().rstrip(".")
-        entity_sentences = []
-        for prop, val in filtered:
-            prop_text = prop.strip()
-            val_text = val.strip()
-
-            # Default sentence
-            sentence = f"{entity_label_clean}'s {prop_text} is {val_text}."
-
-            # Semantic enhancement if question context is present
-            if question_emb is not None:
-                prop_emb = embedding_model.encode(prop_text, convert_to_tensor=True)
-                val_emb = embedding_model.encode(val_text, convert_to_tensor=True)
-                prop_sim = util.cos_sim(question_emb, prop_emb).item()
-                val_sim = util.cos_sim(question_emb, val_emb).item()
-                combined_sim = 0.6 * prop_sim + 0.4 * val_sim
-                if combined_sim > 0.6:
-                    sentence = f"{entity_label_clean} is related to {val_text} ({prop_text})."
-
-            entity_sentences.append(sentence)
-
-        sentences[uri] = entity_sentences
-
-    return facts_filtered, sentences
-
-
-def merge_and_clean_entities(falcon_entities, spotlight_entities):
-
-    # Step 1: Merge (Falcon priority)
-    merged = {**spotlight_entities, **falcon_entities}
-
-    # Step 2: Clean overlapping substring entities
-    clean = {}
-    labels = list(merged.values())
-
-    for uri, label in merged.items():
-        label_lower = label.lower()
-        # skip short/partial labels if they appear inside a longer one
-        if any(
-            (label_lower in other.lower() and label_lower != other.lower())
-            for other in labels
-        ):
-            continue
-        clean[uri] = label
-
-    return clean
-
-def get_entity_facts(qid, property_filter=None, limit=50):
-    endpoint = "https://query.wikidata.org/sparql"
-    sparql = SPARQLWrapper(endpoint)
-    sparql.setReturnFormat(JSON)
-
-    filter_clause = f"FILTER(?p = wd:{property_filter})" if property_filter else ""
-
-    query = f"""
-    SELECT ?p ?pLabel ?o ?oLabel WHERE {{
-      wd:{qid} ?p ?o .
-      {filter_clause}
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-    }}
-    LIMIT {limit}
-    """
-
-    sparql.setQuery(query)
-
-    try:
-        results = sparql.query().convert()
-    except Exception as e:
-        print(f"⚠️ SPARQL query failed for {qid} ({property_filter}): {e}")
-        return []
-
-    facts = []
-    for r in results["results"]["bindings"]:
-        p_uri = r["p"]["value"]
-        p_label = r.get("pLabel", {}).get("value", "")
-        o_label = r.get("oLabel", {}).get("value", "")
-        pid = p_uri.split("/")[-1]
-        facts.append({
-            "property": p_label or pid,
-            "value": o_label,
-            "pid": pid,
-        })
-
-    return facts
-
-def run_sparql_query(query, endpoint="https://query.wikidata.org/sparql"):
-    headers = {
-        "Accept": "application/sparql-results+json",
-        "User-Agent": "EntityLinkingPipeline/1.0 (https://example.org)"
-    }
-    try:
-        response = requests.get(endpoint, params={"query": query}, headers=headers, timeout=30)
-        if response.status_code == 429:
-            print("[SPARQL] Rate limit hit (429) — retrying after delay...")
-            import time; time.sleep(5)
-            response = requests.get(endpoint, params={"query": query}, headers=headers, timeout=30)
-
-        response.raise_for_status()
-        data = response.json()
-        results = []
-        for b in data.get("results", {}).get("bindings", []):
-            row = {}
-            for k, v in b.items():
-                row[k] = v.get("value", "")
-            results.append(row)
-        return results
-
-    except Exception as e:
-        print(f"[SPARQL ERROR] {e}")
-        return []
+    return None
 
 
 def enrich_query_with_entities_and_facts(original_text):
@@ -732,6 +191,10 @@ def enrich_query_with_entities_and_facts(original_text):
     dbpedia_entities = merged_dbpedia
 
     falcon_qids = correct_entity_labels(falcon_qids)
+    # Try to detect composite phrase QIDs like "state flower of arizona"
+    falcon_qids, composite_mappings = resolve_composite_entity(falcon_qids)
+    if composite_mappings:
+        print("[INFO] Composite mappings found:", json.dumps(composite_mappings, indent=2))
     dbpedia_entities = correct_entity_labels(dbpedia_entities)
 
     # ------------------- Wikidata Entities -------------------
@@ -753,6 +216,80 @@ def enrich_query_with_entities_and_facts(original_text):
         question=original_text,
         entity_types=entity_types
     )
+
+
+    # --- NEW: Enrich using composite mappings (via DBpedia + Wikidata fallback) ---
+    if composite_mappings:
+        print("[INFO] Running composite QID enrichment (DBpedia + Wikidata fallback)...")
+
+        for orig_cqid, comp in composite_mappings.items():
+            prop_label = comp.get("prop_label")
+            entity_label = comp.get("entity_label")
+            resolved_qid = comp.get("resolved_qid")
+            prop_values = comp.get("property_values", [])
+
+            # ✅ 1️⃣ If resolve_composite_entity() already found DBpedia values, use them directly
+            if prop_values:
+                for val_uri, val_label in prop_values:
+                    synthetic_sentence = f"{entity_label}'s {prop_label} is {val_label}."
+                    print(f"[COMPOSITE RESULT] {synthetic_sentence}")
+
+                    qid_facts_combined.setdefault(resolved_qid, []).append({
+                        "property": prop_label,
+                        "value": val_label,
+                        "uri": val_uri,
+                        "provenance": "dbpedia-direct"
+                    })
+                    readable_sentences.setdefault(resolved_qid, []).append(synthetic_sentence)
+                continue  # skip further enrichment if we already have DBpedia result
+
+            # ✅ 2️⃣ Otherwise, fall back to enrichment as before
+            print(f"[COMPOSITE ENRICH] Trying to answer '{prop_label} of {entity_label}'")
+
+            matched_dbpedia_uri = None
+            for uri, label in dbpedia_entities.items():
+                if label.lower() == entity_label.lower() or entity_label.lower() in label.lower():
+                    matched_dbpedia_uri = uri
+                    break
+
+            if not matched_dbpedia_uri:
+                print(f"[WARN] No DBpedia entity found for '{entity_label}', skipping.")
+                continue
+
+            all_facts = query_dbpedia_facts(matched_dbpedia_uri)
+            all_facts += query_dbpedia_2hop_facts(matched_dbpedia_uri)
+
+            if not all_facts:
+                print(f"[WARN] No DBpedia facts found for {entity_label}")
+                continue
+
+            prop_emb = embedding_model.encode(prop_label, convert_to_tensor=True)
+            scored = []
+            for p, v in all_facts:
+                if not p or not v:
+                    continue
+                p_emb = embedding_model.encode(p, convert_to_tensor=True)
+                v_emb = embedding_model.encode(v, convert_to_tensor=True)
+                score = max(util.cos_sim(prop_emb, p_emb).item(), util.cos_sim(prop_emb, v_emb).item())
+                if score >= 0.45:
+                    scored.append((score, p, v))
+
+            if not scored:
+                print(f"[INFO] No semantically close DBpedia facts for '{prop_label}' in {entity_label}")
+                continue
+
+            scored.sort(reverse=True, key=lambda x: x[0])
+            best_fact = scored[0][1:]
+
+            synthetic_sentence = f"{entity_label}'s {prop_label} is {best_fact[1]}."
+            print(f"[COMPOSITE RESULT] {synthetic_sentence}")
+
+            qid_facts_combined.setdefault(resolved_qid, []).append({
+                "property": prop_label,
+                "value": best_fact[1],
+                "provenance": "dbpedia-composite"
+            })
+            readable_sentences.setdefault(resolved_qid, []).append(synthetic_sentence)
 
     # ------------------- DBpedia Facts -------------------
     dbpedia_entities_labels = {uri: [label] for uri, label in dbpedia_entities.items()}
@@ -821,6 +358,13 @@ def enrich_query_with_entities_and_facts(original_text):
                   for s in sentences]
         return [s for score, s in sorted(scored, reverse=True) if score >= min_score]
 
+    # ------------------- Reformulated Query (improved for location questions) -------------------
+    def rank_sentences_by_similarity(question, sentences, min_score=0.65):
+        q_emb = embedding_model.encode(question, convert_to_tensor=True)
+        scored = [(util.cos_sim(q_emb, embedding_model.encode(s, convert_to_tensor=True)).item(), s)
+                  for s in sentences]
+        return [s for score, s in sorted(scored, reverse=True) if score >= min_score]
+
     expanded_sentences = []
     for sentences in readable_sentences.values():
         expanded_sentences.extend(rank_sentences_by_similarity(original_text, sentences))
@@ -833,10 +377,34 @@ def enrich_query_with_entities_and_facts(original_text):
     ranked_expanded = [s for score, s in sorted(ranked_expanded, reverse=True) if score >= 0.5]
     top_sentences = ranked_expanded[:1]
 
-    reformulated_query = f"{original_text} {' '.join(top_sentences)}"
-    reformulated_query = re.sub(r"\s*\.\s*$", "", reformulated_query.strip())
-    # if falcon_relations:
-    #     reformulated_query += "  🔍 Relation terms incorporated into reformulated query."
+
+
+
+    # Try to prefer a direct place-of-birth answer from filtered facts
+    direct_answer = find_direct_answer_from_facts(original_text, qid_facts_filtered, dbpedia_facts_filtered)
+
+    if direct_answer:
+        ans = direct_answer.strip()
+
+        # Clean timestamps (e.g., 1977-04-21T00:00:00Z → 1977-04-21)
+        ans = re.sub(r"T\d{2}:\d{2}:\d{2}Z", "", ans)
+
+        # If we got a valid date or year, append it directly to the query
+        if re.match(r"^\d{4}(-\d{2}-\d{2})?$", ans):
+            reformulated_query = f"{original_text} {ans}"
+        else:
+            reformulated_query = f"{original_text} {ans}"
+    else:
+        if top_sentences:
+            best_sentence = top_sentences[0].strip()
+            answer_match = re.search(r"is\s+(.+?)\.*$", best_sentence)
+            if answer_match:
+                short_answer = re.sub(r"\.$", "", answer_match.group(1).strip())
+            else:
+                short_answer = re.sub(r"\.$", "", best_sentence.split()[-1].strip())
+            reformulated_query = f"{original_text} {short_answer}".strip()
+        else:
+            reformulated_query = original_text.strip()
 
     # ------------------- Build Result -------------------
     result = {
@@ -864,262 +432,11 @@ def enrich_query_with_entities_and_facts(original_text):
     return result
 
 
-
-
-# -----------------------------
-# Clean & Structured Print
-# -----------------------------
-def print_clean_pipeline_result(result, max_facts_per_entity=5):
-    entity_labels = {**result['falcon_qids'], **result['dbpedia_entities']}
-
-    print("\n" + "=" * 50)
-    print(f"Original Query: {result['original_query']}")
-    print("=" * 50)
-
-    # --- Entities ---
-    print("\n[Entities]")
-    for eid, label in entity_labels.items():
-        source = "Wikidata" if eid in result['falcon_qids'] else "DBpedia"
-        print(f"  {source}: {label} ({eid})")
-
-    # --- Merge and deduplicate facts ---
-    def normalize_facts(facts_dict):
-        merged = {}
-        for eid, facts in facts_dict.items():
-            unique = set((prop.lower(), val.lower()) for prop, val in facts)
-            merged[eid] = [(prop.capitalize(), val.capitalize()) for prop, val in unique]
-        return merged
-
-    merged_wikidata = normalize_facts(result['wikidata_facts_filtered'])
-    merged_dbpedia = normalize_facts(result['dbpedia_facts_filtered'])
-
-    # --- Filtered Facts ---
-    if any(merged_wikidata.values()) or any(merged_dbpedia.values()):
-        print("\n[Filtered Facts]")
-        for eid, facts in merged_wikidata.items():
-            if facts:
-                print(f"  {result['falcon_qids'][eid]} (Wikidata):")
-                for prop, val in facts[:max_facts_per_entity]:
-                    print(f"    - {prop}: {val}")
-        for eid, facts in merged_dbpedia.items():
-            if facts:
-                print(f"  {result['dbpedia_entities'][eid]} (DBpedia):")
-                for prop, val in facts[:max_facts_per_entity]:
-                    print(f"    - {prop}: {val}")
-
-    # --- Natural Language Summary ---
-    if any(result['natural_language_summary'].values()):
-        print("\n[Natural Language Summary]")
-        for eid, sentences in result['natural_language_summary'].items():
-            if sentences:
-                label = entity_labels.get(eid, eid)
-                unique_sentences = sorted(set(sentences))
-                for sentence in unique_sentences[:max_facts_per_entity]:
-                    print(f"  - {sentence}")
-
-    # --- Reformulated Query (concise) ---
-    top_sentences = []
-    for sentences in result['natural_language_summary'].values():
-        top_sentences.extend(sentences[:max_facts_per_entity])
-    reformulated_query = f"{result['original_query']} {' '.join(top_sentences)}"
-
-    print("\n[Reformulated Query]")
-    print(f"  {reformulated_query}")
-    print("=" * 50)
-
-
-def display_full_pipeline_result(result, max_facts_per_entity=10, show_scores=True):
-
-    # === Core Display Utilities ===
-    def print_entities():
-        print("\n[Entities & Linking]")
-        all_entities = {**result.get('falcon_qids', {}), **result.get('dbpedia_entities', {})}
-        entity_types = result.get('entity_types', {})
-        for eid, label in all_entities.items():
-            src = "Wikidata" if eid in result.get('falcon_qids', {}) else "DBpedia"
-            types = ", ".join(entity_types.get(eid, []))
-            url = f"https://www.wikidata.org/wiki/{eid}" if src == "Wikidata" else f"http://dbpedia.org/resource/{eid}"
-            print(f"  - {label} ({src}, {eid})")
-            if types:
-                print(f"      Types: {types}")
-            print(f"      URL: {url}")
-
-    def print_facts_section(facts_dict, entities_dict, title, source="wikidata"):
-        print(f"\n[{title}]")
-        for eid, facts in facts_dict.items():
-            if not facts:
-                continue
-            elabel = entities_dict.get(eid, eid)
-            print(f"→ {elabel} ({eid})")
-            for f in facts[:max_facts_per_entity]:
-                if isinstance(f, dict):
-                    prop = f.get("property") or f.get("p")
-                    val = f.get("value") or f.get("v")
-                    pid = f.get("pid")
-                    score = f.get("score")
-                    prov = f.get("provenance", "")
-                elif isinstance(f, (list, tuple)) and len(f) >= 2:
-                    prop, val = f[:2]
-                    pid = f[2] if len(f) > 2 else None
-                    score = f[3] if len(f) > 3 else None
-                    prov = f[4] if len(f) > 4 else ""
-                else:
-                    continue
-
-                pid_str = f" ({pid})" if pid else ""
-                prov_str = f" ← {prov}" if prov else ""
-                score_str = f"  [score={score:.3f}]" if show_scores and isinstance(score, (int, float)) else ""
-                prop_url = f"https://www.wikidata.org/wiki/Property:{pid}" if pid and source == "wikidata" else ""
-                val_url = f"https://www.wikidata.org/wiki/{val}" if isinstance(val, str) and val.startswith("Q") else ""
-                val_display = f"{val} ({val_url})" if val_url else val
-
-                if prop_url:
-                    print(f"    • {prop}{pid_str}: {val_display}{score_str}{prov_str}")
-                    print(f"       → {prop_url}")
-                else:
-                    print(f"    • {prop}{pid_str}: {val_display}{score_str}{prov_str}")
-
-    def print_relation_diagnostics():
-        print("\n[Relations Identified]")
-        rels = result.get("falcon_relations", {})
-        if not rels:
-            print("  (none)")
-            return
-        for rid, label in rels.items():
-            wikidata_url = f"https://www.wikidata.org/wiki/Property:{rid}" if rid.startswith("P") else f"http://dbpedia.org/ontology/{rid}"
-            print(f"  - {label} ({rid})")
-            print(f"      URL: {wikidata_url}")
-
-    # 🔍 NEW: Show which entities have facts for each relation
-    def print_relation_entity_mapping():
-        print("\n[Relations ↔ Entities Mapping]")
-        rels = result.get("falcon_relations", {})
-        if not rels:
-            print("  (none)")
-            return
-        found_any = False
-        for rid, rlabel in rels.items():
-            matching_entities = []
-            for eid, facts in result.get('wikidata_facts_combined', {}).items():
-                if any(
-                        (
-                                isinstance(f, dict)
-                                and any(rlabel.lower() in str(v).lower() or rid in str(v) for v in f.values())
-                        ) or (
-                                isinstance(f, (list, tuple))
-                                and any(rlabel.lower() in str(x).lower() or rid in str(x) for x in f)
-                        ) or (
-                                isinstance(f, str)
-                                and (rlabel.lower() in f.lower() or rid in f)
-                        )
-                        for f in facts
-                ):
-                    matching_entities.append(result['falcon_qids'].get(eid, eid))
-            if matching_entities:
-                found_any = True
-                print(f"  - {rlabel} ({rid}) → {', '.join(matching_entities)}")
-            else:
-                print(f"  - {rlabel} ({rid}) → no matching facts found")
-        if not found_any:
-            print("  (no relation-linked entities)")
-
-    # 🔍 NEW: Print facts that correspond directly to relations (like 'products')
-    def print_relation_facts():
-        print("\n[Relation-driven Facts]")
-        rels = result.get("falcon_relations", {})
-        if not rels:
-            print("  (none)")
-            return
-        for rid, rlabel in rels.items():
-            print(f"\n→ Relation: {rlabel} ({rid})")
-            found = False
-            for eid, facts in result.get('wikidata_facts_combined', {}).items():
-                elabel = result['falcon_qids'].get(eid, eid)
-                for f in facts:
-                    prop = f[0] if isinstance(f, (list, tuple)) else f.get("property")
-                    val = f[1] if isinstance(f, (list, tuple)) else f.get("value")
-                    if rlabel.lower() in str(prop).lower() or rid in str(prop):
-                        found = True
-                        print(f"   • {elabel} → {rlabel}: {val}")
-            if not found:
-                print("   (no matching facts for this relation)")
-
-    def trace_filtered_facts():
-        print("\n[Trace: Filtered Fact Origins]")
-        filtered = result.get("wikidata_facts_filtered", {})
-        if not filtered:
-            print("  (none)")
-            return
-        for eid, facts in filtered.items():
-            label = result['falcon_qids'].get(eid, eid)
-            for fact in facts:
-                prop, val = fact[:2]
-                origin = []
-                if (prop, val) in result['wikidata_facts'].get(eid, []):
-                    origin.append("1-hop")
-                if (prop, val) in result['wikidata_facts_2hop'].get(eid, []):
-                    origin.append("2-hop")
-                if (prop, val) in result['wikidata_facts_combined'].get(eid, []):
-                    origin.append("combined")
-                origin_str = "/".join(origin) or "unknown"
-                print(f"  {label} • [{prop}] {val}  ← came from {origin_str}")
-
-    def print_summary():
-        print("\n[Natural Language Summary]")
-        summary = result.get('natural_language_summary', {})
-        for eid, sentences in summary.items():
-            label = result['falcon_qids'].get(eid, result['dbpedia_entities'].get(eid, eid))
-            print(f"→ {label}")
-            for s in sentences:
-                relation_mark = ""
-                for rel_label in result.get("falcon_relations", {}).values():
-                    if rel_label.lower() in s.lower():
-                        relation_mark = "  🔍 [relation-based]"
-                        break
-                print(f"   • {s}{relation_mark}")
-
-    def print_reformulated_query():
-        print("\n[Reformulated Query]")
-        rq = result.get('reformulated_query', '')
-        if any(rel.lower() in rq.lower() for rel in result.get("falcon_relations", {}).values()):
-            print(f"  {rq}")
-            print("  🔍 Relation terms incorporated into reformulated query.")
-        else:
-            print(f"  {rq}")
-
-    # === Display Order ===
-    print("=" * 100)
-    print(f"Original Query:\n  {result.get('original_query', '')}")
-    print("=" * 100)
-
-    print_entities()
-    print_relation_diagnostics()
-    print_relation_entity_mapping()   # 🔍 NEW
-    print_relation_facts()            # 🔍 NEW
-
-    print_facts_section(result.get('wikidata_facts', {}), result.get('falcon_qids', {}), "Wikidata Facts (1-hop)", "wikidata")
-    print_facts_section(result.get('wikidata_facts_2hop', {}), result.get('falcon_qids', {}), "Wikidata Facts (2-hop)", "wikidata")
-    print_facts_section(result.get('wikidata_facts_combined', {}), result.get('falcon_qids', {}), "Wikidata Facts (Combined)", "wikidata")
-    print_facts_section(result.get('wikidata_facts_filtered', {}), result.get('falcon_qids', {}), "Wikidata Facts (Filtered)", "wikidata")
-
-    print_facts_section(result.get('dbpedia_facts_raw', {}), result.get('dbpedia_entities', {}), "DBpedia Facts (1-hop)", "dbpedia")
-    print_facts_section(result.get('dbpedia_facts_2hop', {}), result.get('dbpedia_entities', {}), "DBpedia Facts (2-hop)", "dbpedia")
-    print_facts_section(result.get('dbpedia_facts_combined', {}), result.get('dbpedia_entities', {}), "DBpedia Facts (Combined)", "dbpedia")
-    print_facts_section(result.get('dbpedia_facts_filtered', {}), result.get('dbpedia_entities', {}), "DBpedia Facts (Filtered)", "dbpedia")
-
-    trace_filtered_facts()
-    print_summary()
-    print_reformulated_query()
-
-    print("=" * 100)
-
-
-# -----------------------------
-# Example Usage
 # # -----------------------------
-prompt = "who is moira en x men?"
-result = enrich_query_with_entities_and_facts(prompt)
-# print_clean_pipeline_result(result)
-#
-display_full_pipeline_result(result,1)
-
+# # Example Usage
+# # # # -----------------------------
+# prompt = "who did cam newton sign with?"
+# result = enrich_query_with_entities_and_facts(prompt)
+# # print_clean_pipeline_result(result)
+# #
+# display_full_pipeline_result(result,1)

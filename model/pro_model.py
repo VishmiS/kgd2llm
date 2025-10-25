@@ -128,22 +128,26 @@ class Mymodel(nn.Module):
         self.args = args
         self.max_seq_length = max_seq_length
         self.model_name_or_path = model_name_or_path
-        self.keep_max_layer = -1 #updated
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name_or_path,
-            trust_remote_code=True,
+        self.keep_max_layer = -1  # updated
+
+        # ✅ FORCE BERT: Use BERT-specific classes
+        from transformers import BertTokenizer, BertModel
+
+        self.tokenizer = BertTokenizer.from_pretrained(
+            'bert-base-uncased',  # Force BERT tokenizer
             truncation_side='right',
             padding_side=self.args.padding_side
         )
 
-        # Fix pad_token if it's missing
+        # ✅ BERT already has [PAD] token, so no need for eos_token handling
         if self.tokenizer.pad_token is None:
-            if self.tokenizer.eos_token is not None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            else:
-                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            self.tokenizer.pad_token = '[PAD]'
+            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.tokenizer.pad_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.pad_token)
-        self.plm_model = AutoModel.from_pretrained(self.model_name_or_path, trust_remote_code=True)
+
+        # ✅ FORCE BERT: Load BERT model
+        self.plm_model = BertModel.from_pretrained('bert-base-uncased')
+
         self.emb_dim = self.plm_model.config.hidden_size
         self.num_heads = args.num_heads
         self.ln = args.ln

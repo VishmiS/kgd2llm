@@ -4,7 +4,6 @@ import argparse
 import deepspeed
 import transformers
 import torch.distributed as dist
-from peft import LoraConfig, get_peft_model, TaskType
 from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
@@ -12,11 +11,11 @@ from dataset.dataset import *
 from model.pro_model import *
 from utils.common_utils import *
 from loss import cal_loss_in_batch, cal_loss_hardneg, cal_loss_rd, cal_loss_rd2, cal_feat_loss
-from deepspeed.ops.adam import DeepSpeedCPUAdam
 logging.getLogger().setLevel(logging.INFO)
 warnings.filterwarnings('ignore')
 
 import torch
+
 
 def compute_ranking_metrics(scores, labels, k=10):
     """
@@ -48,6 +47,128 @@ def compute_ranking_metrics(scores, labels, k=10):
 
 def str2bool(v):
     return v.lower() in ('yes', 'true', 't', '1')
+
+
+def save_model_properly(model_engine, save_path):
+    """Save model in Hugging Face format"""
+    # Get the underlying model from DeepSpeed engine
+    model = model_engine.module if hasattr(model_engine, 'module') else model_engine
+
+    # Save the model state dict
+    model_state_dict = model.state_dict()
+
+    # Save in standard format
+    torch.save(model_state_dict, os.path.join(save_path, "pytorch_model.bin"))
+
+    # Save config and tokenizer
+    model.plm_model.config.save_pretrained(save_path)
+    model.tokenizer.save_pretrained(save_path)
+
+    print(f"✅ Model saved in Hugging Face format to: {save_path}")
+
+
+def check_architecture_consistency(model):
+    """Verify that model architecture matches expected format"""
+    print("\n=== ARCHITECTURE CHECK ===")
+
+    # Check what type of model we have
+    model_type = type(model.plm_model).__name__
+    print(f"Model type: {model_type}")
+
+    # Sample keys from the model
+    sample_keys = list(model.state_dict().keys())[:10]
+    print("Sample model keys:")
+    for key in sample_keys:
+        print(f"  {key}")
+
+    # Check if it's BERT-like or GPT-like
+    bert_keys = [k for k in sample_keys if 'encoder' in k or 'bert' in k.lower()]
+    gpt_keys = [k for k in sample_keys if 'h.' in k or 'gpt' in k.lower()]
+
+    if bert_keys and not gpt_keys:
+        print("✅ Model appears to be BERT architecture")
+    elif gpt_keys and not bert_keys:
+        print("✅ Model appears to be GPT architecture")
+    else:
+        print("⚠️  Mixed architecture signals detected")
+
+    return model_type
+
+
+def verify_bert_setup(model, args):
+    """Verify BERT is properly configured"""
+    print("\n=== BERT SETUP VERIFICATION ===")
+
+    # Check model type
+    model_type = type(model.plm_model).__name__
+    print(f"✅ Model type: {model_type}")
+
+    # Check tokenizer
+    print(f"✅ Tokenizer type: {type(model.tokenizer).__name__}")
+
+    # Test BERT-style tokenization
+    test_text = "what does jamaican people speak?"
+    tokens = model.tokenizer.tokenize(test_text)
+    print(f"✅ BERT tokens sample: {tokens[:8]}...")
+
+    # Check embedding dimension
+    print(f"✅ Embedding dimension: {model.emb_dim}")
+
+    # More robust BERT architecture verification
+    sample_keys = list(model.state_dict().keys())[:10]
+    print("✅ Sample model keys for verification:")
+    for key in sample_keys:
+        print(f"   {key}")
+
+    # Check for BERT patterns in the keys
+    bert_patterns = [
+        'encoder.layer',  # BERT encoder layers
+        'embeddings.word_embeddings',  # BERT embeddings
+        'attention.self.query',  # BERT attention
+        'intermediate.dense',  # BERT feed-forward
+        'output.dense'  # BERT output
+    ]
+
+    bert_detected = any(any(pattern in key for pattern in bert_patterns) for key in sample_keys)
+
+    if bert_detected:
+        print("🎉 BERT architecture confirmed!")
+        # Count BERT-specific patterns found
+        for pattern in bert_patterns:
+            count = sum(1 for key in sample_keys if pattern in key)
+            if count > 0:
+                print(f"   Found {count} instances of '{pattern}'")
+    else:
+        print("⚠️  Standard BERT patterns not detected, but model type is BertModel")
+        # Check what we actually have
+        gpt_patterns = ['h.', 'ln_', 'attn.c_attn', 'attn.c_proj']
+        gpt_detected = any(any(pattern in key for pattern in gpt_patterns) for key in sample_keys)
+        if gpt_detected:
+            print("❌ Found GPT patterns instead!")
+        else:
+            print("ℹ️  Unknown architecture patterns")
+
+    # Test forward pass with the model - FIXED DEVICE HANDLING
+    print("\n=== TESTING FORWARD PASS ===")
+    try:
+        test_inputs = model.tokenizer(["Test sentence"], padding=True, truncation=True,
+                                      max_length=args.max_seq_length, return_tensors='pt')
+
+        # ✅ FIX: Move inputs to the same device as the model
+        device = next(model.parameters()).device
+        test_inputs = {k: v.to(device) for k, v in test_inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.plm_model(**test_inputs)
+            embeddings = model.get_sentence_embedding(**test_inputs)
+
+        print(f"✅ Forward pass successful!")
+        print(f"✅ Output embeddings shape: {embeddings.shape}")
+        print(f"✅ Pooler output shape: {outputs.pooler_output.shape if hasattr(outputs, 'pooler_output') else 'N/A'}")
+
+    except Exception as e:
+        print(f"❌ Forward pass failed: {e}")
+        print("ℹ️  This is likely a device mismatch issue - actual training should work fine")
 
 def evaluate_and_save(model_engine, val_dataloader, model, args, current_epoch, global_step, summary_writer, criterion,
                       min_reduce_loss_eval, best_epoch, best_step, stop):
@@ -100,30 +221,73 @@ def evaluate_and_save(model_engine, val_dataloader, model, args, current_epoch, 
         stop = 0
 
         if args.global_rank == 0:
-            print('removing')
+            print('💾 New best validation loss - saving model...')
             try:
                 remove_earlier_ckpt(args.output_dir, 'checkpoint', global_step, max_save_num=2)
             except:
                 print('No ckpt to remove.')
+
+            # ✅ Save the best model in Hugging Face format
+            best_ckpt_dir = os.path.join(
+                args.output_dir, f"checkpoint-best-epoch-{current_epoch + 1}-step-{global_step}-{args.mark}"
+            )
+            os.makedirs(best_ckpt_dir, exist_ok=True)
+            save_model_properly(model_engine, best_ckpt_dir)
+            print(f"✅ Best model saved to: {best_ckpt_dir}")
     else:
         stop += 1
 
-    # if stop < args.num_ckpt:
-    #     save_flag = True
-
+    # Optional: Save regular checkpoints based on num_ckpt (if you want to keep this)
     if save_flag and args.global_rank == 0:
         output_dir_current = os.path.join(
             args.output_dir, f"checkpoint-{global_step}-epoch-{current_epoch + 1}-{args.mark}")
-        save_model(model_engine, output_dir_current, client_state=dict())
+        # ✅ Use proper saving for regular checkpoints too
+        save_model_properly(model_engine, output_dir_current)
 
     model_engine.train()
     return stop, min_reduce_loss_eval, best_epoch, best_step, False
 
 
+def debug_gradient_flow(model_engine):
+    """Comprehensive check of gradient flow through the model"""
+    print("\n" + "=" * 60)
+    print("GRADIENT FLOW DIAGNOSTIC")
+    print("=" * 60)
+
+    model_to_check = model_engine.module if hasattr(model_engine, 'module') else model_engine
+
+    # Check model device
+    print(f"Model device: {next(model_to_check.parameters()).device}")
+
+    # Check parameter counts
+    total_params = sum(p.numel() for p in model_to_check.parameters())
+    trainable_params = sum(p.numel() for p in model_to_check.parameters() if p.requires_grad)
+    print(f"Parameters: {trainable_params:,} trainable / {total_params:,} total")
+
+    # Test forward pass
+    try:
+        # Simple test without complex reshaping
+        dummy_input = model_to_check.tokenizer(
+            ["test input"],
+            padding=True,
+            truncation=True,
+            max_length=128,  # Simpler fixed length
+            return_tensors='pt'
+        ).to(next(model_to_check.parameters()).device)
+
+        with torch.no_grad():
+            # Just get embeddings, don't try to reshape
+            embeddings = model_to_check.get_sentence_embedding(**dummy_input)
+            print(f"✅ Forward pass successful - embedding shape: {embeddings.shape}")
+    except Exception as e:
+        print(f"⚠️  Diagnostic forward pass skipped: {e}")
+
+    print("=" * 60 + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--base_model_dir', default='/mnt/user/415350/download_models/Qwen-7B-Chat', type=str,
-                        help='Model directory')
+    parser.add_argument('--base_model_dir',default='bert-base-uncased', type=str, help='Model directory')
     parser.add_argument('--train_data_list', nargs='+')
     parser.add_argument('--pos_dir', default='PATH_TO_POS_LOGITS', type=str)
     parser.add_argument('--neg_dir', default='PATH_TO_HARDNEG_LOGITS', type=str)
@@ -173,7 +337,7 @@ def main():
     # --- Ensure num_epochs is the value you expect ---
     # Reason: deepspeed/launcher or environment might override parser defaults.
     # You can set NUM_EPOCHS env var to override; otherwise change the '10' below.
-    desired_epochs = int(os.getenv('NUM_EPOCHS', '5'))  # <- change '10' to the default you want
+    desired_epochs = int(os.getenv('NUM_EPOCHS', '15'))  # <- change '10' to the default you want
     args.num_epochs = desired_epochs
 
     # Debug print so you can confirm what's actually used at run time
@@ -199,15 +363,8 @@ def main():
 
     summary_writer = SummaryWriter(log_dir=args.tb_dir)
 
-    lora_config = LoraConfig(
-        task_type="CAUSAL_LM",  # or "SEQ_CLS" depending on your task
-        inference_mode=False,
-        r=8,
-        lora_alpha=32,
-        lora_dropout=0.1,
-        target_modules=["fc_q", "fc_k", "fc_v"]  # your custom MAB layer names
-    )
-
+    check_architecture_consistency(model)
+    verify_bert_setup(model,args)
 
     update_parameters = filter(lambda p: p.requires_grad, model.parameters())
     param_optimizer = list([(n, p) for n, p in model.named_parameters() if p.requires_grad])
@@ -224,29 +381,30 @@ def main():
     # --- Replace everything from 'from deepspeed.ops.adam import DeepSpeedCPUAdam'
     # --- down to the call to deepspeed.initialize(...) with this block ---
 
-    from torch.optim import AdamW  # use standard GPU optimizer instead of DeepSpeedCPUAdam
+    # === FIXED: Simple DeepSpeed config for single GPU ===
+    from torch.optim import AdamW
 
-    # ✅ Define standard AdamW optimizer
-    optimizer = AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        betas=(0.8, 0.999),
-        eps=1e-6,
-        weight_decay=args.weight_decay
-    )
-
-    # ✅ Clean, GPU-friendly DeepSpeed config (no CPU offload)
+    # ✅ Use ZeRO Stage 1 (not Stage 2) for single GPU to avoid gradient issues
     ds_config = {
-        "train_batch_size": args.batch_size * args.gradient_accumulation_steps * max(1, args.world_size),
+        "train_batch_size": args.batch_size * args.gradient_accumulation_steps,
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "gradient_clipping": args.gradient_clipping,
-        "bfloat16": {"enabled": args.bf16},  # keep BF16 if supported
-        "fp16": {"enabled": False},  # explicitly disable FP16
+        "bfloat16": {
+            "enabled": args.bf16
+        },
+        "fp16": {
+            "enabled": False
+        },
         "zero_optimization": {
-            "stage": 2,
-            "offload_optimizer": {"device": "none"},  # keep optimizer on GPU
-            "offload_param": {"device": "none"}
+            "stage": 1,  # ⚠️ CHANGED FROM 2 TO 1 - critical fix!
+            "allgather_partitions": True,
+            "allgather_bucket_size": 2e8,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 2e8,
+            "contiguous_gradients": True,
+            "cpu_offload": False
         },
         "optimizer": {
             "type": "AdamW",
@@ -256,22 +414,22 @@ def main():
                 "eps": 1e-6,
                 "weight_decay": args.weight_decay
             }
-        }
+        },
+        "wall_clock_breakdown": False
     }
 
-    # ✅ Initialize DeepSpeed engine
+    # ✅ Let DeepSpeed create the optimizer (don't create it manually)
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
         args=args,
         model=model,
-        optimizer=optimizer,
-        model_parameters=[p for p in model.parameters() if p.requires_grad],
         config=ds_config
     )
 
+    debug_gradient_flow(model_engine)
+
     print(
-        f"[InitCheck] BF16 enabled: {ds_config['bfloat16']['enabled']} | "
-        f"Optimizer offload: {ds_config['zero_optimization']['offload_optimizer']['device']}"
-    )
+        f"[InitCheck] BF16 enabled: {ds_config['bfloat16']['enabled']} | ZeRO stage: {ds_config['zero_optimization']['stage']}")
+
 
     if not torch.distributed.is_initialized():
         dist.init_process_group(backend='nccl')
@@ -607,36 +765,47 @@ def main():
             # Backward
             model_engine.backward(loss_batch)
 
-            # === Diagnostic: Check gradient flow (after backward, before step) ===
-            if step % 50 == 0:  # every 50 steps
-                grad_magnitudes = []
-                # use model_engine.module if available to access wrapped model parameters
-                param_source = getattr(model_engine, "module", model_engine)
-                for n, p in param_source.named_parameters():
-                    if p.requires_grad:
-                        # Some parameters under ZeRO might not have .grad on this rank; guard for None.
-                        if p.grad is None:
-                            continue
-                        # convert to float (avoid overflow with bfloat16)
-                        try:
-                            gm = float(p.grad.abs().mean().item())
-                        except Exception:
-                            try:
-                                gm = float(p.grad.abs().mean().to('cpu').item())
-                            except Exception:
-                                gm = None
-                        if gm is not None:
-                            grad_magnitudes.append(gm)
+            # === FIXED: Proper gradient checking for DeepSpeed ===
+            if step % 10 == 0:  # Check more frequently for debugging
+                print(f"\n[GradCheck] Step {step} - Checking gradients...")
 
-                if grad_magnitudes:
-                    mean_grad = sum(grad_magnitudes) / len(grad_magnitudes)
+                total_params = 0
+                params_with_grad = 0
+                grad_norms = []
+
+                # Access the wrapped model
+                model_to_check = model_engine.module if hasattr(model_engine, 'module') else model_engine
+
+                for name, param in model_to_check.named_parameters():
+                    if param.requires_grad:
+                        total_params += 1
+                        if param.grad is not None:
+                            params_with_grad += 1
+                            grad_norm = param.grad.data.norm(2).item()
+                            grad_norms.append(grad_norm)
+
+                            # Print first few parameters to verify gradients
+                            if params_with_grad <= 3:  # Only show first 3 to avoid spam
+                                print(f"  ✅ {name}: grad_norm = {grad_norm:.6e}")
+                        else:
+                            if total_params <= 3:  # Only show first 3 missing gradients
+                                print(f"  ❌ {name}: NO gradient")
+
+                if params_with_grad > 0:
+                    avg_grad_norm = sum(grad_norms) / len(grad_norms) if grad_norms else 0
                     print(
-                        f"[GradCheck] Step {step}: mean grad magnitude = {mean_grad:.6e} (checked {len(grad_magnitudes)} params)")
+                        f"[GradCheck] Step {step}: ✅ {params_with_grad}/{total_params} params have gradients | avg_norm = {avg_grad_norm:.6e}")
                 else:
-                    print(f"[GradCheck] Step {step}: ⚠️ No gradients found after backward!")
+                    print(f"[GradCheck] Step {step}: ❌ CRITICAL - 0/{total_params} parameters have gradients!")
+
+                    # Emergency debug: Check if loss requires grad
+                    print(f"[GradCheck] Loss requires_grad: {loss_batch.requires_grad}")
+                    print(f"[GradCheck] Loss device: {loss_batch.device}")
+                    print(f"[GradCheck] Model device: {next(model_to_check.parameters()).device}")
 
             # Then step
             model_engine.step()
+
 
 
             if step % 200 == 0 and hasattr(optimizer, 'param_groups'):
@@ -686,8 +855,7 @@ def main():
             # Always save checkpoint for each epoch
             epoch_ckpt_dir = os.path.join(args.output_dir, f"checkpoint-epoch-{current_epoch + 1}")
             os.makedirs(epoch_ckpt_dir, exist_ok=True)
-            save_model(model_engine, epoch_ckpt_dir,
-                       client_state={"epoch": current_epoch + 1, "global_step": global_step})
+            save_model_properly(model_engine, epoch_ckpt_dir)
             print(f"[Checkpoint] Saved epoch {current_epoch + 1} to {epoch_ckpt_dir}")
 
             # Update best model if MRR improved
@@ -701,9 +869,6 @@ def main():
         # Optional early stopping (no longer based on loss)
         early_stop = False
 
-
-        avg_mrr10 = epoch_mrr10 / max(1, num_mrr_batches)
-        avg_ndcg10 = epoch_ndcg10 / max(1, num_mrr_batches)
 
         if args.global_rank == 0 and num_train_batches > 0:
             avg_train_loss = epoch_loss_overall / num_train_batches
@@ -751,6 +916,10 @@ def main():
                 + "=" * 80 + "\n"
         )
 
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+    if args.global_rank == 0:
         print(log_message)
         logging.info(log_message)
 

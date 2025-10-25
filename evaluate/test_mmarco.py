@@ -32,11 +32,11 @@ CORPUS_FILE  = "/root/pycharm_semanticsearch/dataset/ms_marco/val/corpus.tsv"
 QRELS_FILE   = "/root/pycharm_semanticsearch/dataset/ms_marco/val/qrels.tsv"
 
 # Settings
-MAX_QUERIES = 500     # process all queries
+MAX_QUERIES = 10000000     # process all queries
 MAX_CORPUS_DOCS = 1008986   # process all corpus documents
 RECALL_K = 10
 BATCH_SIZE = 16
-CORPUS_EMB_FILE = "corpus_embs.pt"
+CORPUS_EMB_FILE = "corpus_embs_mmarco.pt"
 
 args = Namespace(
     num_heads=8,
@@ -48,7 +48,34 @@ args = Namespace(
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+from transformers import AutoTokenizer, AutoModel
 
+# 🔹 Load model + tokenizer properly
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+model = AutoModel.from_pretrained(MODEL_PATH, trust_remote_code=True).to(device)
+model.eval()
+
+# 🔹 Define a helper to get mean-pooled sentence embeddings
+def encode_texts(texts, batch_size=16):
+    all_embs = []
+    with torch.no_grad():
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            inputs = tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt"
+            ).to(device)
+
+            outputs = model(**inputs)
+            # Mean-pool over the token dimension
+            attn_mask = inputs["attention_mask"]
+            last_hidden = outputs.last_hidden_state
+            emb = (last_hidden * attn_mask.unsqueeze(-1)).sum(1) / attn_mask.sum(1, keepdim=True)
+            all_embs.append(emb.cpu())
+    return torch.cat(all_embs, dim=0)
 def load_queries(max_queries=None):
     """Load queries from TSV"""
     queries = {}
@@ -107,14 +134,12 @@ def encode_corpus(model, corpus, batch_size=BATCH_SIZE, force_rebuild=False):
     Automatically rebuilds if cache is stale or invalid.
     """
     cache_hash = compute_hash(MODEL_PATH, CORPUS_FILE, len(corpus), batch_size)
-    cache_file = f"corpus_embs_{cache_hash}.pt"
+    cache_file = f"corpus_embs_mmarco_{cache_hash}.pt"
 
-    # Optionally remove outdated cache file
-    if force_rebuild and os.path.exists(cache_file):
-        print("[INFO] Rebuilding corpus embeddings (forced)...")
-        os.remove(cache_file)
+    # if force_rebuild and os.path.exists(cache_file):
+    #     print("[INFO] Rebuilding corpus embeddings (forced)...")
+    #     os.remove(cache_file)
 
-    # Load cache if it exists
     if os.path.exists(cache_file) and not force_rebuild:
         print(f"[INFO] Using cached embeddings: {cache_file}")
         data = torch.load(cache_file, map_location=device)
@@ -128,20 +153,32 @@ def encode_corpus(model, corpus, batch_size=BATCH_SIZE, force_rebuild=False):
     with torch.no_grad():
         for i in tqdm(range(0, len(corpus_texts), batch_size), desc="Encoding Corpus"):
             batch_texts = corpus_texts[i:i + batch_size]
-            batch_embs = model.encode(batch_texts, convert_to_tensor=True).to(device)
-            corpus_embs_list.append(batch_embs)
+            batch_embs = encode_texts(batch_texts, batch_size).to(device)
+
+            # ✅ Debug print per batch
+            norms = batch_embs.norm(dim=-1)
+            # print(f"[DEBUG] Batch {i//batch_size} embedding norms: min={norms.min().item():.4f}, max={norms.max().item():.4f}, mean={norms.mean().item():.4f}")
+
+            # ✅ L2 normalize batch embeddings
+            batch_embs = batch_embs / norms.unsqueeze(1)
+
+            # Check for NaNs/Infs
+            if torch.isnan(batch_embs).any() or torch.isinf(batch_embs).any():
+                raise ValueError(f"NaN or Inf detected in batch embeddings at batch {i//batch_size}")
+
+            corpus_embs_list.append(batch_embs.cpu())
 
     corpus_embs = torch.cat(corpus_embs_list, dim=0)
 
-    # ✅ Normalize once after concatenation
-    corpus_embs = corpus_embs / corpus_embs.norm(dim=-1, keepdim=True)
-    print(f"[DEBUG] Corpus embedding norm (mean): {torch.norm(corpus_embs, dim=-1).mean().item():.4f}")
+    # ✅ Final sanity check
+    final_norms = corpus_embs.norm(dim=-1)
+    print(f"[DEBUG] Final corpus embedding norms: min={final_norms.min().item():.4f}, max={final_norms.max().item():.4f}, mean={final_norms.mean().item():.4f}")
 
-    # Save to disk
-    torch.save({"ids": corpus_ids, "embs": corpus_embs.cpu()}, cache_file)
+    torch.save({"ids": corpus_ids, "embs": corpus_embs}, cache_file)
     print(f"[INFO] Saved L2-normalized corpus embeddings to {cache_file}")
 
-    return corpus_ids, corpus_embs
+    return corpus_ids, corpus_embs.to(device)
+
 
 
 def evaluate_mmarco():
@@ -161,17 +198,20 @@ def evaluate_mmarco():
 
     print(f"[INFO] Filtered queries to only those with qrels. Total unique queries with answers: {len(queries)}")
 
-    # Initialize your student model
-    model = Mymodel(model_name_or_path=MODEL_PATH, args=args).to(device)
+    print("[INFO] Loading model from:", MODEL_PATH)
 
+
+
+
+    # model = Mymodel(model_name_or_path=MODEL_PATH, args=args).to(device)
     # Load the trained student weights safely (ignore missing/extra keys)
-    state_dict = torch.load(f"{MODEL_PATH}/pytorch_model.bin", map_location=device)
-    model.load_state_dict(state_dict, strict=False)
+    # state_dict = torch.load(f"{MODEL_PATH}/pytorch_model.bin", map_location=device)
+    # model.load_state_dict(state_dict, strict=False)
+    #
+    # model.eval()  # set to eval mode
 
-    model.eval()  # set to eval mode
-
-    # Encode corpus embeddings
-    corpus_ids, corpus_embs = encode_corpus(model, corpus, force_rebuild=False)
+    # Encode corpus embeddings (always rebuild to match current model)
+    corpus_ids, corpus_embs = encode_corpus(model, corpus, force_rebuild=True)
     print(f"[DEBUG] Corpus embedding norm (mean): {torch.norm(corpus_embs, dim=-1).mean().item():.4f}")
 
     # FAISS CPU index (IP = inner product) with L2-normalized embeddings
@@ -190,12 +230,12 @@ def evaluate_mmarco():
 
     with torch.no_grad():
         printed_examples = 0  # counter for printed samples
-        for i in tqdm(range(0, len(query_texts), BATCH_SIZE), desc="Evaluating Queries"):
+        for i in tqdm(range(0, len(query_texts), 10), desc="Evaluating Queries"):
             batch_ids = query_ids[i:i + BATCH_SIZE]
             batch_texts = query_texts[i:i + BATCH_SIZE]
 
             # Encode batch queries
-            batch_embs = model.encode(batch_texts, convert_to_tensor=True)
+            batch_embs = encode_texts(batch_texts, BATCH_SIZE)
             batch_embs = batch_embs / batch_embs.norm(dim=-1, keepdim=True)  # ✅ normalize in torch
             batch_embs = batch_embs.cpu().numpy().astype("float32")
             print(f"[DEBUG] Query embedding norm (mean): {np.linalg.norm(batch_embs, axis=1).mean():.4f}")

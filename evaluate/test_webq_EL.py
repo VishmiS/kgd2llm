@@ -1,5 +1,5 @@
 # conda activate faiss-gpu-py38
-# python /root/pycharm_semanticsearch/evaluate/test_mmarco_EL.py
+# python /root/pycharm_semanticsearch/evaluate/test_webq_EL.py
 
 
 import sys, os
@@ -14,22 +14,23 @@ import random, numpy as np, torch
 import pandas as pd
 import re
 from langdetect import detect
-from entity_linking.pipeline import enrich_query_with_entities_and_facts, print_clean_pipeline_result
+from entity_linking.pipeline import enrich_query_with_entities_and_facts
 import pickle
 import time
 
+
 # Paths
-MODEL_PATH = "/root/pycharm_semanticsearch/PATH_TO_OUTPUT_MODEL/mmarco/final_student_model_fp32"
-QUERIES_FILE = "/root/pycharm_semanticsearch/dataset/ms_marco/val/queries.tsv"
-CORPUS_FILE  = "/root/pycharm_semanticsearch/dataset/ms_marco/val/corpus.tsv"
-QRELS_FILE   = "/root/pycharm_semanticsearch/dataset/ms_marco/val/qrels.tsv"
+MODEL_PATH = "/root/pycharm_semanticsearch/PATH_TO_OUTPUT_MODEL/webq/final_student_model_fp32"
+QUERIES_FILE = "/root/pycharm_semanticsearch/dataset/web_questions/test/queries.tsv"
+CORPUS_FILE  = "/root/pycharm_semanticsearch/dataset/web_questions/test/corpus.tsv"
+QRELS_FILE   = "/root/pycharm_semanticsearch/dataset/web_questions/test/qrels.tsv"
 
 # Settings
-MAX_QUERIES = 100 # 101093       process all queries
+MAX_QUERIES = 200 # 101093       process all queries
 MAX_CORPUS_DOCS = 1008986 # 1008986     limit corpus documents for testing
 RECALL_K = 10
 BATCH_SIZE = 16
-CORPUS_EMB_FILE = "corpus_embs_mmarco_EL.pt"
+CORPUS_EMB_FILE = "corpus_embs_webq_EL.pt"
 
 args = Namespace(
     num_heads=8,
@@ -100,7 +101,7 @@ def encode_corpus(model, corpus, batch_size=BATCH_SIZE, force_rebuild=False):
     Automatically rebuilds if cache is stale or invalid.
     """
     cache_hash = compute_hash(MODEL_PATH, CORPUS_FILE, len(corpus), batch_size)
-    cache_file = f"corpus_embs_mmarco_EL_{cache_hash}.pt"
+    cache_file = f"corpus_embs_webq_EL_{cache_hash}.pt"
 
     # Optionally remove outdated default cache file
     if force_rebuild and os.path.exists(cache_file):
@@ -156,7 +157,7 @@ def summarize_relation_mapping(relation_mapping, falcon_relations, falcon_qids):
     return "; ".join(summaries)
 
 
-def evaluate_mmarco():
+def evaluate_webq():
     # Sanity checks
     for f in [QUERIES_FILE, CORPUS_FILE, QRELS_FILE, MODEL_PATH]:
         assert os.path.exists(f), f"{f} not found"
@@ -190,18 +191,18 @@ def evaluate_mmarco():
     # UPDATED TO INCLUDE ENTITY LINKING
 
     query_ids = list(queries.keys())
-    ENRICHED_QUERIES_CACHE = "enriched_queries.pkl"
-    ENRICHED_RECORDS_CACHE = "enriched_records.pkl"
+    ENRICHED_QUERIES_CACHE = "enriched_queries_webq.pkl"
+    ENRICHED_RECORDS_CACHE = "enriched_records_webq.pkl"
 
-    force_rebuild_enrichment = True
+    force_rebuild_enrichment = False
 
     if force_rebuild_enrichment or not (
             os.path.exists(ENRICHED_QUERIES_CACHE) and os.path.exists(ENRICHED_RECORDS_CACHE)):
 
         query_texts = []
         enriched_records = []
-
-        for qid in query_ids:
+        print("[INFO] Starting entity linking enrichment and extraction...")
+        for idx, qid in enumerate(query_ids):
             query_text_original = queries[qid].strip()
             query_lang = "unknown"
 
@@ -324,13 +325,31 @@ def evaluate_mmarco():
 
             })
 
+            # 🧠 Periodically save partial progress to disk
+            if (idx + 1) % 200 == 0:  # every 20 queries
+                with open(ENRICHED_QUERIES_CACHE, "wb") as f:
+                    pickle.dump(query_texts, f)
+                with open(ENRICHED_RECORDS_CACHE, "wb") as f:
+                    pickle.dump(enriched_records, f)
+                print(f"[INFO] Saved progress: {idx + 1}/{len(query_ids)} queries processed...")
+
             time.sleep(3) # if you want the pause
+
+            # ✅ Final save once everything is done
+            with open(ENRICHED_QUERIES_CACHE, "wb") as f:
+                pickle.dump(query_texts, f)
+            with open(ENRICHED_RECORDS_CACHE, "wb") as f:
+                pickle.dump(enriched_records, f)
+            # print(
+            #     f"[INFO] Finished and saved all enriched data to {ENRICHED_QUERIES_CACHE} and {ENRICHED_RECORDS_CACHE}")
     else:
-        # Load from cache
+        # Load from cache to skip enrichment step
+        print("[INFO] Loading preprocessed entity linking cache...")
         with open(ENRICHED_QUERIES_CACHE, "rb") as f:
             query_texts = pickle.load(f)
         with open(ENRICHED_RECORDS_CACHE, "rb") as f:
             enriched_records = pickle.load(f)
+        print(f"[INFO] Loaded {len(query_texts)} cached enriched queries.")
 
     query_rows = []
     entity_rows = []
@@ -618,7 +637,7 @@ def evaluate_mmarco():
     print(f"Recall@{RECALL_K}: {avg_recall:.2%}")
 
     # ✅ Save results to text file
-    results_file = "evaluation_results.txt"
+    results_file = "evaluation_results_webq_EL.txt"
     with open(results_file, "w") as f:
         f.write("==== Evaluation Summary ====\n")
         f.write(f"Total queries evaluated: {num_eval}\n")
@@ -628,7 +647,7 @@ def evaluate_mmarco():
     queries_df = pd.DataFrame(query_rows)
     entities_df = pd.DataFrame(entity_rows)
 
-    output_path = "entity_linking_results_mmarco.xlsx"
+    output_path = "entity_linking_results_webq.xlsx"
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         queries_df.to_excel(writer, index=False, sheet_name="queries")
         entities_df.to_excel(writer, index=False, sheet_name="entities")
@@ -637,4 +656,4 @@ def evaluate_mmarco():
     print(f"[INFO] Results saved to {results_file}")
 
 if __name__ == "__main__":
-    evaluate_mmarco()
+    evaluate_webq()
