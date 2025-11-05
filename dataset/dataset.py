@@ -9,7 +9,7 @@ import random
 from utils.common_utils import load_pickle
 import pickle
 
-DATASET_ID_DICT = {'snli': 1, 'sts': 2, 'mmarco': 3, 'wq': 4}
+DATASET_ID_DICT = {'snli': 1, 'sts': 2, 'mmarco': 3, 'wq': 4, 'covid': 5}
 
 
 def load_text_dataset(name, pos_dir, neg_dir, file_path, neg_K, res_data, split):
@@ -252,35 +252,29 @@ def fast_lookup_pos_logit(pos_dict, query, answer):
     return [0.0, 0.0]
 
 
-def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
-    print(f"\n🔄 Loading dataset '{name}'")
-    print(f"  ▶️ Positive pickle file: {pos_dir}")
-    print(f"  ▶️ Negative pickle file: {neg_dir}")
-    print(f"  ▶️ Data file (TSV/JSONL): {file_path}\n")
+def load_ir_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
+    print(f"Loading IR training dataset: {name}")
+    print(f"  Positive logits cache: {pos_dir}")
+    print(f"  Hard negatives cache: {neg_dir}")
+    print(f"  Data file: {file_path}")
 
     data = []
-    # =========================================
-    # ✅ Cached Teacher Logit Loader (fast path)
-    # =========================================
-    cache_file = pos_dir
-    if not os.path.exists(cache_file):
-        print(f"🧠 Teacher logits cache not found: {cache_file}")
-        print("🚀 Generating teacher logits once and caching to disk...")
-        from tqdm import tqdm
+
+    # Step 1: Load or generate teacher logits
+    if not os.path.exists(pos_dir):
+        print("Teacher logits cache not found, generating now...")
         from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-        # Load teacher model (adjust name if different)
         teacher_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
         teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_name)
         teacher_model = AutoModelForSequenceClassification.from_pretrained(teacher_name).cuda().eval()
 
-        # Read all queries/answers
         teacher_logits = {}
         with open(file_path, encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
-            for row in tqdm(reader, desc="Generating teacher logits"):
-                text_a = row["sentence1"]
-                text_b = row["sentence2"]
+            for row in reader:
+                text_a = row["sentence1"].strip()
+                text_b = row["sentence2"].strip()
 
                 inputs = teacher_tokenizer(
                     text_a, text_b, return_tensors="pt", truncation=True,
@@ -293,33 +287,35 @@ def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
 
                 teacher_logits[(text_a, text_b)] = logits
 
-        # Save once
-        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-        import pickle
-        with open(cache_file, "wb") as f:
+        # Save cache
+        os.makedirs(os.path.dirname(pos_dir), exist_ok=True)
+        with open(pos_dir, "wb") as f:
             pickle.dump(teacher_logits, f)
-        print(f"✅ Teacher logits cached to {cache_file}")
+        print(f"Generated and cached teacher logits for {len(teacher_logits)} samples")
         pos_logits = teacher_logits
     else:
-        pos_logits = load_pickle(cache_file)
-        print(f"✅ Loaded cached teacher logits from {cache_file} ({len(pos_logits)} entries)")
+        pos_logits = load_pickle(pos_dir)
+        print(f"Loaded cached teacher logits: {len(pos_logits)} entries")
 
+    # Step 2: Load hard negatives
     hard_neg_house = load_pickle(neg_dir)
+    print(f"Loaded hard negatives: {len(hard_neg_house)} queries")
 
-    # Counters
+    # Counters for statistics
     total_records = 0
     with_hard_negs = 0
     with_pos_logits = 0
     missing_hard_neg_count = 0
     not_found_count = 0
 
+    # Step 3: Process data samples
     with open(file_path, encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
-        for id, row in enumerate(reader):
+        for row in reader:
             total_records += 1
 
-            text_a = row['sentence1']
-            text_b = row['sentence2']
+            text_a = row['sentence1'].strip()
+            text_b = row['sentence2'].strip()
 
             # Check for hard negatives
             neg_list = hard_neg_house.get(text_a, [])
@@ -328,6 +324,7 @@ def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
                 continue
             with_hard_negs += 1
 
+            # Sample hard negatives
             if len(neg_list) < neg_K:
                 num = math.ceil(neg_K / len(neg_list))
                 negs_logits = random.sample(neg_list * num, neg_K)
@@ -335,37 +332,28 @@ def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
                 negs_logits = random.sample(neg_list, neg_K)
 
             hardnegs, hardneg_logits = zip(*negs_logits)
-            hardnegs = [sample[:320] for sample in hardnegs]
+            hardnegs = [sample.strip() for sample in hardnegs]
             hardneg_logits = list(hardneg_logits)
 
-            # Lookup positive logit vector
-            # ✅ Use flexible lookup just like QA loader
+            # Get positive logits
             pos_logit_for_sample = fast_lookup_pos_logit(pos_logits, text_a, text_b)
-
-            # Ensure positive logits are numpy arrays (for consistent shape)
             pos_logit_for_sample = np.array(pos_logit_for_sample, dtype=np.float32)
-
-            # Match embedding dimension with hard negatives
-            if len(pos_logit_for_sample.shape) == 1 and len(pos_logit_for_sample) != len(hardneg_logits[0]):
-                # Expand scalar or short vector to same dim as hardneg logits
-                pos_logit_for_sample = np.full_like(hardneg_logits[0], float(np.mean(pos_logit_for_sample)))
 
             if np.all(pos_logit_for_sample == 0.0):
                 not_found_count += 1
             else:
                 with_pos_logits += 1
 
-            data.append((text_a[:50], text_b[:320], pos_logit_for_sample.tolist(),
-                         hardnegs, hardneg_logits, 1))
+            data.append((text_a, text_b, pos_logit_for_sample.tolist(), hardnegs, hardneg_logits, 1))
 
-    # Stats reporting
-    print("\n📊 Dataset Load Summary")
-    print(f"   • Total records in input file: {total_records}")
-    print(f"   • Records with hard negatives: {with_hard_negs}")
-    print(f"   • Records with NO hard negatives: {missing_hard_neg_count}")
-    print(f"   • Records with positive logits: {with_pos_logits}")
-    print(f"   • Records missing positive logits: {not_found_count}")
-    print(f"   • Final usable samples: {len(data)}\n")
+    # Step 4: Print detailed statistics
+    print("Dataset Load Summary")
+    print(f"  Total records in input file: {total_records}")
+    print(f"  Records with hard negatives: {with_hard_negs}")
+    print(f"  Records with NO hard negatives: {missing_hard_neg_count}")
+    print(f"  Records with positive logits: {with_pos_logits}")
+    print(f"  Records missing positive logits: {not_found_count}")
+    print(f"  Final usable samples: {len(data)}")
 
     sample_num = len(data)
     res_data.extend(data)
@@ -373,178 +361,25 @@ def load_qa_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
     return res_data, sample_num
 
 
+def load_ir_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
+    print(f"Loading IR validation dataset: {name}")
+    print(f"  Data file: {file_path}")
 
-def load_qa_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
     data = []
     skipped_count = 0
-
-    with open(file_path, encoding='utf-8') as f:
-        reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
-
-        for id, row in enumerate(reader):
-            # Use .get to avoid KeyError if header mismatch
-            text_a = row.get('sentence1')
-            text_b = row.get('sentence2')
-
-            # Replace None with empty string
-            if text_a is None:
-                text_a = ""
-                skipped_count += 1
-            if text_b is None:
-                text_b = ""
-                skipped_count += 1
-
-            # Normalize the "No Answer Present." placeholder
-            if text_b.strip().lower() == "no answer present.":
-                text_b = ""
-
-            # Safe slicing even if text_a/text_b == ""
-            data.append((text_a[:50], text_b[:320], [], [], [], 1))
-
-    if skipped_count:
-        print(f"⚠️ {skipped_count} val samples had missing fields, replaced with empty string.")
-
-    sample_num = len(data)
-    res_data.extend(data)
-    return res_data, sample_num
-
-
-def load_mmarco_dataset_train(name, pos_dir, neg_dir, file_path, neg_K, res_data):
-    import torch
-    from tqdm import tqdm
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
-    print(f"\n🔄 Loading dataset '{name}'")
-    print(f"  ▶️ Positive pickle file: {pos_dir}")
-    print(f"  ▶️ Negative pickle file: {neg_dir}")
-    print(f"  ▶️ Data file (TSV/JSONL): {file_path}\n")
-
-    data = []
-
-    # ==========================================================
-    # 🧠 Step 1: Ensure teacher logits exist or generate them
-    # ==========================================================
-    if not os.path.exists(pos_dir):
-        print(f"🧠 Teacher logits cache not found: {pos_dir}")
-        print("🚀 Generating teacher logits using cross-encoder/ms-marco-MiniLM-L-6-v2 ...")
-
-        teacher_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-        teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_name)
-        teacher_model = AutoModelForSequenceClassification.from_pretrained(teacher_name).cuda().eval()
-
-        teacher_logits = {}
-        with open(file_path, encoding='utf-8') as f:
-            reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
-            for row in tqdm(reader, desc="Generating teacher logits for MS MARCO"):
-                text_a = row['sentence1']
-                text_b = row['sentence2']
-
-                inputs = teacher_tokenizer(
-                    text_a, text_b,
-                    return_tensors='pt',
-                    truncation=True,
-                    max_length=256,
-                    padding='max_length'
-                ).to('cuda')
-
-                with torch.no_grad():
-                    logits = teacher_model(**inputs).logits.squeeze().cpu().numpy().tolist()
-
-                teacher_logits[(text_a, text_b)] = logits
-
-        # Save to pickle
-        os.makedirs(os.path.dirname(pos_dir), exist_ok=True)
-        with open(pos_dir, 'wb') as f:
-            pickle.dump(teacher_logits, f)
-
-        pos_logits = teacher_logits
-        print(f"✅ Generated and cached teacher logits for {len(pos_logits)} samples at {pos_dir}")
-    else:
-        pos_logits = load_pickle(pos_dir)
-        print(f"✅ Loaded cached teacher logits from {pos_dir} ({len(pos_logits)} entries)")
-
-    # ==========================================================
-    # 🧩 Step 2: Load hard negatives (from teacher scores)
-    # ==========================================================
-    hard_neg_house = load_pickle(neg_dir)
-
-    # Counters
     total_records = 0
-    with_hard_negs = 0
-    with_pos_logits = 0
-    missing_hard_neg_count = 0
-    not_found_count = 0
 
-    # ==========================================================
-    # 📥 Step 3: Read the MS MARCO training pairs
-    # ==========================================================
     with open(file_path, encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
-        for _, row in enumerate(reader):
+
+        for row in reader:
             total_records += 1
 
-            text_a = row['sentence1']
-            text_b = row['sentence2']
-
-            # Hard negatives
-            neg_list = hard_neg_house.get(text_a, [])
-            if not neg_list:
-                missing_hard_neg_count += 1
-                continue
-            with_hard_negs += 1
-
-            if len(neg_list) < neg_K:
-                num = math.ceil(neg_K / len(neg_list))
-                negs_logits = random.sample(neg_list * num, neg_K)
-            else:
-                negs_logits = random.sample(neg_list, neg_K)
-
-            hardnegs, hardneg_logits = zip(*negs_logits)
-            hardnegs = [sample[:320] for sample in hardnegs]
-            hardneg_logits = list(hardneg_logits)
-
-            # Positive teacher logits
-            pos_logit_for_sample = fast_lookup_pos_logit(pos_logits, text_a, text_b)
-
-            pos_logit_for_sample = np.array(pos_logit_for_sample, dtype=np.float32)
-            if np.all(pos_logit_for_sample == 0.0):
-                not_found_count += 1
-            else:
-                with_pos_logits += 1
-
-            data.append(
-                (text_a.strip(), text_b.strip(), pos_logit_for_sample.tolist(), hardnegs, hardneg_logits, 1)
-            )
-
-    # ==========================================================
-    # 📊 Step 4: Print dataset summary
-    # ==========================================================
-    print("\n📊 Dataset Load Summary")
-    print(f"   • Total records in input file: {total_records}")
-    print(f"   • Records with hard negatives: {with_hard_negs}")
-    print(f"   • Records with NO hard negatives: {missing_hard_neg_count}")
-    print(f"   • Records with positive logits: {with_pos_logits}")
-    print(f"   • Records missing positive logits: {not_found_count}")
-    print(f"   • Final usable samples: {len(data)}\n")
-
-    sample_num = len(data)
-    res_data.extend(data)
-    return res_data, sample_num
-
-
-def load_mmarco_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
-    data = []
-    skipped_count = 0
-
-    with open(file_path, encoding='utf-8') as f:
-        reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
-
-        for id, row in enumerate(reader):
             # Use .get to avoid KeyError if header mismatch
             text_a = row.get('sentence1')
             text_b = row.get('sentence2')
 
-            # Replace None with empty string
+            # Handle missing fields
             if text_a is None:
                 text_a = ""
                 skipped_count += 1
@@ -552,15 +387,22 @@ def load_mmarco_dataset_val(name, pos_dir, neg_dir, file_path, neg_K, res_data):
                 text_b = ""
                 skipped_count += 1
 
+            # Clean and strip text
+            text_a = text_a.strip()
+            text_b = text_b.strip()
+
             # Normalize the "No Answer Present." placeholder
-            if text_b.strip().lower() == "no answer present.":
+            if text_b.lower() == "no answer present.":
                 text_b = ""
 
-            # Safe slicing even if text_a/text_b == ""
-            data.append((text_a[:50], text_b[:320], [], [], [], 1))
+            # For validation, we don't need logits or hard negatives
+            data.append((text_a, text_b, [], [], [], 1))
 
-    if skipped_count:
-        print(f"⚠️ {skipped_count} val samples had missing fields, replaced with empty string.")
+    # Print validation statistics
+    print("Validation Dataset Load Summary")
+    print(f"  Total records in input file: {total_records}")
+    print(f"  Records with missing fields: {skipped_count}")
+    print(f"  Final validation samples: {len(data)}")
 
     sample_num = len(data)
     res_data.extend(data)
@@ -585,24 +427,7 @@ def collate_fn(data):
     res_neg_K = [list(group) for group in zip(*res_neg_K)]
     res_neg_K = [e for l in res_neg_K for e in l]
 
-
-    # Debug prints for pos logits
-    # print("🟢 Total positive logits collected:", len(res_pos_logits))
-    # if len(res_pos_logits) > 0:
-        # print("🔍 Type of first positive logit sample:", type(res_pos_logits[0]))
-        # print("📏 Length of first positive logit sample:", len(res_pos_logits[0]))
-        # If list or numpy array, print length and first few values
-        # if isinstance(res_pos_logits[0], (list, np.ndarray)):
-        #     print("📏 Length of first positive logit sample:", len(res_pos_logits[0]))
-        #     print("👀 First positive logit sample (first 10 elements):", res_pos_logits[0][:10])
-        # else:
-        #     print("👀 First positive logit sample value:", res_pos_logits[0])
-
-    # print("🔴 Total negative logits collected:", len(res_neg_logits))
-
     return res_s_a, res_s_b, torch.FloatTensor(res_pos_logits), res_neg_K, torch.FloatTensor(res_neg_logits), torch.LongTensor(res_task_id)
-
-    # return res_s_a, res_s_b, torch.FloatTensor(np.array(res_pos_logits, dtype=np.float32)), res_neg_K, torch.FloatTensor(res_neg_logits), torch.LongTensor(res_task_id)
 
 
 
@@ -642,11 +467,11 @@ class TrainDataset(Dataset):
                     end_id = len(self.data)
                     self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
                     self.sample_stas[name] = sample_num
-            elif name in ['t2', 'du', 'mmarco', 'wq']:
+            elif name in ['t2', 'du', 'mmarco', 'wq', 'covid']:
                 if name == 'mmarco':
                     start_id = len(self.data)
-                    self.data, sample_num = load_mmarco_dataset_train(name, os.path.join(pos_dir, 'pos_emb/mmarco_train_pos_emb.pkl'),
-                                                                      os.path.join(neg_dir, 'logits/mmarco_train_logits.pkl'),
+                    self.data, sample_num = load_ir_dataset_train(name, os.path.join(pos_dir, 'pos_emb/mmarco_train_pos_logits.pkl'),
+                                                                      os.path.join(neg_dir, 'logits/mmarco_train_neg_logits.pkl'),
                                                                       os.path.join(datadir, 'ms_marco/train/positives.tsv'), self.neg_K,
                                                                       self.data)
                     end_id = len(self.data)
@@ -655,16 +480,24 @@ class TrainDataset(Dataset):
 
                 elif name == 'wq':
                     start_id = len(self.data)
-                    self.data, sample_num = load_qa_dataset_train(name, os.path.join(pos_dir, 'pos_emb/webq_train_pos_emb.pkl'),
-                                                                      os.path.join(neg_dir, 'logits/webq_train_logits.pkl'),
+                    self.data, sample_num = load_ir_dataset_train(name, os.path.join(pos_dir, 'pos_emb/webq_train_pos_logits.pkl'),
+                                                                      os.path.join(neg_dir, 'logits/webq_train_neg_logits.pkl'),
                                                                       os.path.join(datadir, 'web_questions/train/positives.tsv'), self.neg_K,
+                                                                      self.data)
+                    end_id = len(self.data)
+                    self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
+                    self.sample_stas[name] = sample_num
+                elif name == 'covid':
+                    start_id = len(self.data)
+                    self.data, sample_num = load_ir_dataset_train(name, os.path.join(pos_dir, 'pos_emb/covid_train_pos_logits.pkl'),
+                                                                      os.path.join(neg_dir, 'logits/covid_train_neg_logits.pkl'),
+                                                                      os.path.join(datadir, 'covid/train/positives.tsv'), self.neg_K,
                                                                       self.data)
                     end_id = len(self.data)
                     self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
                     self.sample_stas[name] = sample_num
             else:
                 logger.debug('Unknown dataset: {}'.format(name))
-
 
 
         print(f"[DEBUG] TrainDataset initialized with {len(self.data)} samples.")
@@ -699,35 +532,6 @@ class TrainDataset(Dataset):
         return batch_data
 
 
-# --- DEBUG CHECK: Inspect one batch to verify positives vs hard negatives ---
-if __name__ == "__main__":
-    from torch.utils.data import DataLoader
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-
-    dataset = TrainDataset(
-        tokenizer=tokenizer,
-        pos_dir="/root/pycharm_semanticsearch/outputs",  # <-- use actual absolute path
-        neg_dir="/root/pycharm_semanticsearch/outputs",  # <-- actual path
-        datadir="/root/pycharm_semanticsearch/dataset",               # <-- actual data root
-        names=["mmarco"],
-        batch_size=2,
-        neg_K=2,
-    )
-
-    loader = DataLoader(dataset, batch_size=1, collate_fn=collate_fn)
-
-    for batch in loader:
-        queries, positives, pos_logits, hardnegs, hardneg_logits, task_ids = batch
-        print("🔹 Query:", queries[0])
-        print("✅ Positive:", positives[0])
-        print("❌ Hard Negatives:", hardnegs[:2])
-        print("📈 Pos Logit:", pos_logits[0].tolist() if len(pos_logits) > 0 else "N/A")
-        import numpy as np
-        print("🔍 Hardneg logits example:", np.array(hardneg_logits[0]) if len(hardneg_logits) > 0 else "N/A")
-
-        break
 
 class ValDataset(Dataset):
 
@@ -765,12 +569,12 @@ class ValDataset(Dataset):
                     end_id = len(self.data)
                     self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
                     self.sample_stas[name] = sample_num
-            elif name in ['t2', 'du', 'mmarco', 'wq']:
+            elif name in ['t2', 'du', 'mmarco', 'wq', 'covid']:
 
                 if name == 'mmarco':
                     start_id = len(self.data)
-                    self.data, sample_num = load_mmarco_dataset_val(name, os.path.join(pos_dir, 'pos_emb/mmarco_val_pos_emb.pkl'),
-                                                                    os.path.join(neg_dir, 'logits/mmarco_val_logits.pkl'),
+                    self.data, sample_num = load_ir_dataset_val(name, os.path.join(pos_dir, 'pos_emb/mmarco_val_pos_logits.pkl'),
+                                                                    os.path.join(neg_dir, 'logits/mmarco_val_neg_logits.pkl'),
                                                                     os.path.join(datadir, 'ms_marco/val/positives.tsv'), self.neg_K,
                                                                     self.data)
                     end_id = len(self.data)
@@ -778,9 +582,18 @@ class ValDataset(Dataset):
                     self.sample_stas[name] = sample_num
                 elif name == 'wq':
                     start_id = len(self.data)
-                    self.data, sample_num = load_qa_dataset_train(name, os.path.join(pos_dir, 'pos_emb/webq_val_pos_emb.pkl'),
-                                                                      os.path.join(neg_dir, 'logits/webq_val_logits.pkl'),
+                    self.data, sample_num = load_ir_dataset_val(name, os.path.join(pos_dir, 'pos_emb/webq_val_pos_logits.pkl'),
+                                                                      os.path.join(neg_dir, 'logits/webq_val_neg_logits.pkl'),
                                                                       os.path.join(datadir, 'web_questions/val/positives.tsv'), self.neg_K,
+                                                                      self.data)
+                    end_id = len(self.data)
+                    self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
+                    self.sample_stas[name] = sample_num
+                elif name == 'covid':
+                    start_id = len(self.data)
+                    self.data, sample_num = load_ir_dataset_val(name, os.path.join(pos_dir, 'pos_emb/covid_val_pos_logits.pkl'),
+                                                                      os.path.join(neg_dir, 'logits/covid_val_neg_logits.pkl'),
+                                                                      os.path.join(datadir, 'covid/val/positives.tsv'), self.neg_K,
                                                                       self.data)
                     end_id = len(self.data)
                     self.dataset_indices_range[self.dataset_id_dict[name]] = (start_id, end_id)
@@ -816,3 +629,33 @@ class ValDataset(Dataset):
         batch_data = [self.data[i] for i in batch_indices]
         self.step += 1
         return batch_data
+
+
+if __name__ == "__main__":
+    from torch.utils.data import DataLoader
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    dataset = TrainDataset(
+        tokenizer=tokenizer,
+        pos_dir="/root/pycharm_semanticsearch/outputs",
+        neg_dir="/root/pycharm_semanticsearch/outputs",
+        datadir="/root/pycharm_semanticsearch/dataset",
+        names=["covid"],
+        batch_size=2,
+        neg_K=8,
+    )
+
+    loader = DataLoader(dataset, batch_size=1, collate_fn=collate_fn)
+
+    for batch in loader:
+        queries, positives, pos_logits, hardnegs, hardneg_logits, task_ids = batch
+        print("🔹 Query:", queries[0])
+        print("✅ Positive:", positives[0])
+        print("❌ Hard Negatives:", hardnegs[:2])
+        print("📈 Pos Logit:", pos_logits[0].tolist() if len(pos_logits) > 0 else "N/A")
+        import numpy as np
+        print("🔍 Hardneg logits example:", np.array(hardneg_logits[0]) if len(hardneg_logits) > 0 else "N/A")
+
+        break
