@@ -468,3 +468,35 @@ def get_dbpedia_symbol(entity_label: str, prop_label: str):
     except Exception as e:
         print(f"[DBpedia lookup failed] for {entity_label}, {prop_label}: {e}")
         return []
+
+def wikidata_search_label(label: str, search_type="item", limit=5):
+    """
+    Use Wikidata search API to find candidate QIDs or property IDs for a label.
+    Adds a proper User-Agent header to avoid 403 Forbidden errors.
+    search_type: "item" (for Q items) or "property" (for P properties).
+    Returns list of dicts {'id': 'Q123', 'label': 'Arizona', 'description': '...'}
+    """
+    if not label:
+        return []
+
+    params = {
+        "action": "wbsearchentities",
+        "search": label,
+        "language": "en",
+        "format": "json",
+        "limit": limit,
+        "type": "property" if search_type == "property" else "item"
+    }
+
+    headers = {
+        "User-Agent": "EntityLinkingPipeline/1.0"
+    }
+
+    try:
+        r = requests.get("https://www.wikidata.org/w/api.php", params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("search", [])
+    except requests.exceptions.RequestException as e:
+        print(f"[Wikidata search] failed for '{label}': {e}")
+        return []

@@ -1,4 +1,11 @@
 
+
+def convert_covid_knowledge_to_sentences(covid_knowledge):
+    """Lazy import to avoid circular dependencies"""
+    from entity_linking.covid_handler import convert_covid_knowledge_to_sentences as convert_func
+    return convert_func(covid_knowledge)
+
+
 # -----------------------------
 # Clean & Structured Print
 # -----------------------------
@@ -14,6 +21,26 @@ def print_clean_pipeline_result(result, max_facts_per_entity=5):
     for eid, label in entity_labels.items():
         source = "Wikidata" if eid in result['falcon_qids'] else "DBpedia"
         print(f"  {source}: {label} ({eid})")
+
+    # ========== ADD COVID KNOWLEDGE DISPLAY ==========
+    if result.get("is_covid_related"):
+        print("\n[COVID-19 Knowledge]")
+        covid_knowledge = result.get("covid_knowledge", {})
+
+        if not covid_knowledge:
+            print("  No specialized COVID-19 knowledge found")
+        else:
+            # Show mutation highlights
+            if "mutations" in covid_knowledge and covid_knowledge["mutations"]:
+                print(f"  Mutations Found: {len(covid_knowledge['mutations'])}")
+                for mutation in covid_knowledge["mutations"][:3]:  # Show top 3
+                    mutation_type = mutation.get('mutation_type', 'mutation')
+                    print(f"    - {mutation['name']} ({mutation_type})")
+
+            if "spike_mutations" in covid_knowledge and covid_knowledge["spike_mutations"]:
+                print(f"  Spike Mutations: {len(covid_knowledge['spike_mutations'])}")
+                for mutation in covid_knowledge["spike_mutations"][:3]:
+                    print(f"    - {mutation['name']}")
 
     # --- Merge and deduplicate facts ---
     def normalize_facts(facts_dict):
@@ -54,6 +81,12 @@ def print_clean_pipeline_result(result, max_facts_per_entity=5):
     top_sentences = []
     for sentences in result['natural_language_summary'].values():
         top_sentences.extend(sentences[:max_facts_per_entity])
+
+    # ========== ADD COVID KNOWLEDGE TO REFORMULATION ==========
+    if result.get("is_covid_related") and result.get("covid_knowledge"):
+        covid_sentences = convert_covid_knowledge_to_sentences(result["covid_knowledge"])
+        top_sentences.extend(covid_sentences[:3])  # Add top 3 COVID sentences
+
     reformulated_query = f"{result['original_query']} {' '.join(top_sentences)}"
 
     print("\n[Reformulated Query]")
@@ -379,7 +412,69 @@ def display_full_pipeline_result(result, max_facts_per_entity=10, show_scores=Tr
     print_facts_section(result.get('dbpedia_facts_filtered', {}), result.get('dbpedia_entities', {}), "DBpedia Facts (Filtered)", "dbpedia")
 
     trace_filtered_facts()
+
+    # ========== ADD COVID KNOWLEDGE DISPLAY ==========
+    if result.get("is_covid_related"):
+        print("\n[COVID-19 Knowledge Extracted]")
+        covid_knowledge = result.get("covid_knowledge", {})
+
+        if not covid_knowledge:
+            print("  No specialized COVID-19 knowledge found")
+        else:
+            total_facts = sum(len(items) for items in covid_knowledge.values())
+            print(f"  Found {total_facts} COVID-19 facts across {len(covid_knowledge)} categories")
+
+            # Display mutations if available
+            if "mutations" in covid_knowledge and covid_knowledge["mutations"]:
+                print(f"\n  → SARS-CoV-2 Mutations Found ({len(covid_knowledge['mutations'])}):")
+                for i, mutation in enumerate(covid_knowledge["mutations"][:10], 1):  # Show first 10
+                    mutation_type = mutation.get('mutation_type', 'mutation')
+                    print(f"     {i}. {mutation['name']} ({mutation_type})")
+                    if mutation.get('description'):
+                        desc = mutation['description']
+                        if len(desc) > 150:
+                            desc = desc[:150] + "..."
+                        print(f"        {desc}")
+                    if mutation.get('protein'):
+                        print(f"        Affects: {mutation['protein']}")
+                    if mutation.get('variant'):
+                        print(f"        Found in: {mutation['variant']}")
+                    print()
+
+            # Display spike mutations if available
+            if "spike_mutations" in covid_knowledge and covid_knowledge["spike_mutations"]:
+                print(f"  → Spike Protein Mutations ({len(covid_knowledge['spike_mutations'])}):")
+                for i, mutation in enumerate(covid_knowledge["spike_mutations"][:10], 1):
+                    print(f"     {i}. {mutation['name']}")
+                    if mutation.get('description'):
+                        desc = mutation['description']
+                        if len(desc) > 150:
+                            desc = desc[:150] + "..."
+                        print(f"        {desc}")
+                    print()
+
+            # Display variants if available
+            if "variants" in covid_knowledge and covid_knowledge["variants"]:
+                print(f"  → SARS-CoV-2 Variants ({len(covid_knowledge['variants'])}):")
+                for i, variant in enumerate(covid_knowledge["variants"][:5], 1):
+                    print(f"     {i}. {variant['name']}")
+                    if variant.get('description'):
+                        desc = variant['description']
+                        if len(desc) > 100:
+                            desc = desc[:100] + "..."
+                        print(f"        {desc}")
+                    print()
+
+            # Display other COVID categories briefly
+            other_categories = [cat for cat in covid_knowledge.keys()
+                                if cat not in ['mutations', 'spike_mutations', 'variants']
+                                and covid_knowledge[cat]]
+            if other_categories:
+                print(f"  → Other COVID-19 Information:")
+                for category in other_categories:
+                    count = len(covid_knowledge[category])
+                    print(f"     - {category.replace('_', ' ').title()}: {count} items")
+
     print_summary()
     print_reformulated_query()
-
     print("=" * 100)

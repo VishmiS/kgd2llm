@@ -1,9 +1,8 @@
 # conda activate faiss-gpu-py38
-# python /root/pycharm_semanticsearch/evaluate/test_webq.py
+# python /root/pycharm_semanticsearch/evaluate/test_webq2.py
 
 import sys, os
 import torch.nn.functional as F
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import faiss
 from argparse import Namespace
@@ -36,12 +35,11 @@ peft_config = LoraConfig(
 # Paths - Exact paths from your data inspection
 BASE_MODEL_DIR = "/root/pycharm_semanticsearch/PATH_TO_OUTPUT_MODEL/webq"
 DATA_DIR = "/root/pycharm_semanticsearch/dataset"
-OUTPUTS_DIR = "/root/pycharm_semanticsearch"
+OUTPUTS_DIR = "/root/pycharm_semanticsearch/outputs"
 
 # Checkpoints to evaluate (epochs 1 through 8)
-CHECKPOINTS = [f"checkpoint-epoch-9"]
-RESULTS_FILE = os.path.join(OUTPUTS_DIR, "zevaluation_results_webq.csv")
-DETAILED_RESULTS_FILE = os.path.join(OUTPUTS_DIR, "zdetailed_evaluation_results_webq.xlsx")
+CHECKPOINTS = [f"checkpoint-epoch-{i}" for i in range(1, 16)]
+RESULTS_FILE = os.path.join(OUTPUTS_DIR, "webq_evaluation_results.csv")
 
 # EXACT PATHS FROM YOUR DATA INSPECTION
 QUERIES_FILE = os.path.join(DATA_DIR, "web_questions/test/queries.tsv")
@@ -62,8 +60,8 @@ args = Namespace(
     padding_side='right',
     neg_K=3,
     max_seq_length=256,
-    hidden_dim=768,  # Add this - from your model
-    output_dim=512,  # Add this - from your model
+    hidden_dim=768,           # Add this - from your model
+    output_dim=512,           # Add this - from your model
     base_model_dir="bert-base-uncased"  # Add this
 )
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -299,7 +297,6 @@ def verify_model_functionality(model, device):
 
     return train_style_embs
 
-
 def load_model_with_weights(model_path, args, device):
     """Load model with EXACT same architecture as training"""
     print(f"[INFO] Loading model with custom architecture from: {model_path}")
@@ -412,50 +409,6 @@ def quick_diagnostic():
     return data_ok
 
 
-def get_correct_answer(corpus, relevant_doc_ids):
-    """Extract correct answers from relevant documents"""
-    correct_answers = []
-    for doc_id in relevant_doc_ids:
-        if doc_id in corpus:
-            doc_text = corpus[doc_id]
-            # Try to extract the answer part (after the query)
-            if '?' in doc_text:
-                answer_part = doc_text.split('?', 1)[-1].strip()
-                if answer_part:
-                    correct_answers.append(answer_part)
-            else:
-                correct_answers.append(doc_text)
-
-    return correct_answers if correct_answers else ["Answer not found in corpus"]
-
-
-def generate_human_readable_explanation(ranked_doc_ids, relevant_doc_ids, top_docs_sample):
-    """Generate human-readable explanation for retrieval performance"""
-    first_relevant_rank = None
-    for rank, doc_id in enumerate(ranked_doc_ids, 1):
-        if doc_id in relevant_doc_ids:
-            first_relevant_rank = rank
-            break
-
-    if first_relevant_rank is None:
-        return "No relevant documents found in top 10 results."
-    elif first_relevant_rank == 1:
-        return "First relevant document found at rank 1."
-    else:
-        return f"First relevant document found at rank {first_relevant_rank}."
-
-
-def get_top_docs_sample(corpus, ranked_doc_ids, max_samples=3):
-    """Get sample of top retrieved documents with their content"""
-    samples = []
-    for doc_id in ranked_doc_ids[:max_samples]:
-        if doc_id in corpus:
-            samples.append((doc_id, corpus[doc_id][:100] + "..." if len(corpus[doc_id]) > 100 else corpus[doc_id]))
-        else:
-            samples.append((doc_id, "Document not found in corpus"))
-    return samples
-
-
 def evaluate_webq():
     """Main evaluation function for WebQuestions"""
     global MODEL_PATH
@@ -469,7 +422,7 @@ def evaluate_webq():
     for f in critical_files:
         if not os.path.exists(f):
             print(f"❌ Critical file missing: {f}")
-            return 0.0, 0.0, []
+            return 0.0, 0.0
 
     set_seed(42)
     print("[INFO] Random seed fixed to 42 for reproducibility.")
@@ -483,7 +436,7 @@ def evaluate_webq():
     # Verify data consistency
     if not verify_data_consistency(queries, corpus, qrels):
         print("❌ CRITICAL: Data consistency check failed!")
-        return 0.0, 0.0, []
+        return 0.0, 0.0
 
     # Filter to queries that have relevance judgments AND exist in our queries
     valid_queries = {qid: qtext for qid, qtext in queries.items()
@@ -493,7 +446,7 @@ def evaluate_webq():
 
     if len(valid_queries) == 0:
         print("❌ No valid queries for evaluation!")
-        return 0.0, 0.0, []
+        return 0.0, 0.0
 
     # Load model
     print(f"\n[INFO] Loading model from: {MODEL_PATH}")
@@ -519,7 +472,6 @@ def evaluate_webq():
     print(f"✅ FAISS index built with {index_flat.ntotal} documents")
 
     mrr_total, recall_total, num_eval = 0, 0, 0
-    detailed_results = []
 
     query_ids = list(valid_queries.keys())
     query_texts = [
@@ -530,6 +482,7 @@ def evaluate_webq():
     print(f"\n[INFO] Evaluating {len(query_ids)} queries...")
 
     with torch.no_grad():
+        printed_examples = 0
         for i in range(0, len(query_texts), BATCH_SIZE):
             batch_ids = query_ids[i:i + BATCH_SIZE]
             batch_texts = query_texts[i:i + BATCH_SIZE]
@@ -560,12 +513,12 @@ def evaluate_webq():
 
             for j, qid in enumerate(batch_ids):
                 ranked_doc_ids = [corpus_ids[idx] for idx in I[j]]
-                relevant_doc_ids = list(qrels.get(qid, set()))
+                relevant = qrels.get(qid, set())
 
                 # Compute MRR
                 reciprocal_rank = 0
                 for rank, doc_id in enumerate(ranked_doc_ids, start=1):
-                    if doc_id in relevant_doc_ids:
+                    if doc_id in relevant:
                         reciprocal_rank = 1.0 / rank
                         break
                 mrr_total += reciprocal_rank
@@ -578,22 +531,15 @@ def evaluate_webq():
                     recall_at_k = retrieved_relevant / len(relevant_doc_ids)
                 recall_total += recall_at_k
 
-                # Generate detailed results
-                correct_answers = get_correct_answer(corpus, relevant_doc_ids)
-                explanation = generate_human_readable_explanation(ranked_doc_ids, relevant_doc_ids, [])
-                top_docs_sample = get_top_docs_sample(corpus, ranked_doc_ids)
-
-                detailed_results.append({
-                    'query_id': qid,
-                    'query_text': valid_queries[qid],
-                    'relevant_doc_ids': relevant_doc_ids,
-                    'top_10_doc_ids': ranked_doc_ids,
-                    'MRR': reciprocal_rank,
-                    'Recall@10': recall_at_k,
-                    'correct_answers': correct_answers,
-                    'Human_readable_explanation': explanation,
-                    'Top_docs_sample': top_docs_sample
-                })
+                # Print first few examples for debugging
+                if printed_examples < 2 and reciprocal_rank > 0:
+                    print("\n--- Example (Successful Retrieval) ---")
+                    print(f"Query   : {valid_queries[qid]}")
+                    print(f"Relevant docs: {list(relevant)}")
+                    print(f"Retrieved docs: {ranked_doc_ids[:5]}")
+                    print(f"Similarity scores: {D[j][:5]}")
+                    print(f"MRR     : {reciprocal_rank:.4f}")
+                    printed_examples += 1
 
                 num_eval += 1
 
@@ -608,62 +554,11 @@ def evaluate_webq():
     print(f"MRR@{RECALL_K}    : {avg_mrr:.4f}")
     print(f"Recall@{RECALL_K} : {avg_recall:.4f}")
 
-    return avg_mrr, avg_recall, detailed_results
-
-
-def save_detailed_results_to_excel(detailed_results, checkpoint_name):
-    """Save detailed results to Excel file"""
-    if not detailed_results:
-        print("❌ No detailed results to save")
-        return
-
-    # Convert to DataFrame
-    df_data = []
-    for result in detailed_results:
-        row = {
-            'query_id': result['query_id'],
-            'query_text': result['query_text'],
-            'relevant_doc_ids': str(result['relevant_doc_ids']),
-            'top_10_doc_ids': str(result['top_10_doc_ids']),
-            'MRR': result['MRR'],
-            'Recall@10': result['Recall@10'],
-            'correct_answers': ' | '.join(result['correct_answers']),
-            'Human_readable_explanation': result['Human_readable_explanation'],
-            'Top_docs_sample': str(result['Top_docs_sample'])
-        }
-        df_data.append(row)
-
-    df = pd.DataFrame(df_data)
-
-    # Save to Excel
-    try:
-        with pd.ExcelWriter(DETAILED_RESULTS_FILE, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name=f'Results_{checkpoint_name}', index=False)
-
-            # Add summary sheet
-            summary_data = {
-                'Metric': ['Total Queries', 'Average MRR@10', 'Average Recall@10', 'Checkpoint'],
-                'Value': [len(df), df['MRR'].mean(), df['Recall@10'].mean(), checkpoint_name]
-            }
-            summary_df = pd.DataFrame(summary_data)
-            summary_df.to_excel(writer, sheet_name='Summary', index=False)
-
-        print(f"✅ Detailed results saved to: {DETAILED_RESULTS_FILE}")
-
-        # Print first few rows for verification
-        print("\n📊 First 3 rows of detailed results:")
-        print(df.head(3).to_string(index=False))
-
-    except Exception as e:
-        print(f"❌ Failed to save Excel file: {e}")
-        # Fallback to CSV
-        csv_file = DETAILED_RESULTS_FILE.replace('.xlsx', '.csv')
-        df.to_csv(csv_file, index=False)
-        print(f"✅ Results saved to CSV as fallback: {csv_file}")
+    return avg_mrr, avg_recall
 
 
 def evaluate_all_checkpoints():
-    """Evaluate all checkpoints and save results to files"""
+    """Evaluate all checkpoints and save results to file"""
     # Create results file with header
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -671,7 +566,6 @@ def evaluate_all_checkpoints():
 
     print(f"Evaluating {len(CHECKPOINTS)} checkpoints...")
     print(f"Results will be saved to: {RESULTS_FILE}")
-    print(f"Detailed results will be saved to: {DETAILED_RESULTS_FILE}")
 
     for checkpoint in CHECKPOINTS:
         global MODEL_PATH
@@ -690,15 +584,12 @@ def evaluate_all_checkpoints():
             epoch_num = int(checkpoint.split('-')[-1])
 
             # Run evaluation
-            mrr, recall, detailed_results = evaluate_webq()
+            mrr, recall = evaluate_webq()
 
-            # Save summary results to CSV
+            # Save results
             with open(RESULTS_FILE, 'a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([checkpoint, epoch_num, mrr, recall, MAX_QUERIES, datetime.now()])
-
-            # Save detailed results to Excel
-            save_detailed_results_to_excel(detailed_results, checkpoint)
 
             print(f"✅ Completed: {checkpoint} - MRR@10: {mrr:.4f}, Recall@10: {recall:.4f}")
 
@@ -712,9 +603,7 @@ def evaluate_all_checkpoints():
                 writer.writerow([checkpoint, epoch_num, 0.0, 0.0, 0, datetime.now(), f"Error: {str(e)}"])
 
     print(f"\n{'=' * 80}")
-    print("Evaluation completed!")
-    print(f"Summary results saved to: {RESULTS_FILE}")
-    print(f"Detailed results saved to: {DETAILED_RESULTS_FILE}")
+    print("Evaluation completed! Results saved to:", RESULTS_FILE)
 
     # Print summary
     try:

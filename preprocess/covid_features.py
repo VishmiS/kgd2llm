@@ -5,10 +5,9 @@ from utils.common_utils import load_pickle, write_pickle
 from torch.utils.data import TensorDataset, DataLoader
 import torch.nn.functional as F
 import numpy as np
-import gc
 
 
-def mmarco_template_context(query, passage):
+def covid_template_context(query, passage):
     return (
         f"#Q describes a user question. #A describes a web passage. "
         f"Are they related such that #A correctly answers #Q? Answer Can or Cannot.\n"
@@ -29,7 +28,7 @@ def get_simple_embeddings(outputs, attention_mask):
 
 
 def get_distilbert_classification_logits(texts, finetuned_model_path, batch_size=16, max_length=256):
-    """🔥 MEMORY OPTIMIZED: Use FINE-TUNED DistilBERT with reduced batch size"""
+    """🔥 FIXED: Use FINE-TUNED DistilBERT for consistent classification scores"""
     print(f"🔥 Loading FINE-TUNED DistilBERT from {finetuned_model_path}...")
 
     # Use the SAME fine-tuned model as positives
@@ -57,10 +56,6 @@ def get_distilbert_classification_logits(texts, finetuned_model_path, batch_size
             # Convert to probabilities
             probs = torch.softmax(logits.float(), dim=-1)
             all_logits.extend(probs.cpu().numpy().tolist())
-
-            # 🚀 MEMORY OPTIMIZATION: Clear GPU memory
-            del inputs, outputs, logits, probs
-            torch.cuda.empty_cache()
 
     return all_logits
 
@@ -126,7 +121,6 @@ def analyze_negative_logit_quality_enhanced(all_logits, expected_behavior="negat
         'raw_separation': (raw_can - raw_cannot).mean().item()
     }
 
-
 def verify_negative_samples(bm25_dict, sample_size=50):
     """🔥 Verify that negative samples are actually negative"""
     print("🔍 Verifying negative sample quality...")
@@ -153,7 +147,12 @@ def verify_negative_samples(bm25_dict, sample_size=50):
 
 
 def apply_quick_negative_fix(all_logits):
-    """🔥 PROPER FIX: Ensure negatives have high 'Cannot' probability without inversion"""
+    """🔥 PROPER FIX: Ensure negatives have high 'Cannot' probability without inversion
+    Args:
+        all_logits: List of logits from the teacher model
+    Returns:
+        Fixed logits with proper negative discrimination
+    """
     print("🔄 Applying PROPER negative logit fix...")
 
     # Convert to tensor and ensure proper shape
@@ -249,7 +248,12 @@ def apply_quick_negative_fix(all_logits):
 
 
 def create_forced_negative_logits(num_samples):
-    """🔥 EMERGENCY: Create properly discriminated negative logits with diversity"""
+    """🔥 EMERGENCY: Create properly discriminated negative logits with diversity
+    Args:
+        num_samples: Number of logits to generate
+    Returns:
+        List of logits with strong "Cannot" preference
+    """
     print("   Creating forced negative logits with proper discrimination...")
 
     # Base template: Strong preference for "Cannot"
@@ -294,10 +298,53 @@ def create_forced_negative_logits(num_samples):
     return forced_logits_tensor.numpy().tolist()
 
 
-def generate_features_and_inbatch_memory_optimized(
+def analyze_and_fix_negative_logits(all_logits, max_attempts=3):
+    """🔥 COMPREHENSIVE: Multi-stage negative logit fixing with validation
+    Args:
+        all_logits: Original logits from teacher
+        max_attempts: Maximum number of correction attempts
+    Returns:
+        Properly discriminated negative logits
+    """
+    print("\n" + "=" * 60)
+    print("🔥 COMPREHENSIVE NEGATIVE LOGIT CORRECTION")
+    print("=" * 60)
+
+    current_logits = all_logits
+    attempt = 0
+
+    while attempt < max_attempts:
+        attempt += 1
+        print(f"\n🔄 Correction Attempt {attempt}/{max_attempts}...")
+
+        current_logits = apply_quick_negative_fix(current_logits)
+
+        # Convert to tensor for analysis
+        if isinstance(current_logits, list):
+            logits_tensor = torch.tensor(current_logits)
+        else:
+            logits_tensor = current_logits
+
+        probs = torch.softmax(logits_tensor, dim=-1)
+        separation = probs[:, 0].mean().item() - probs[:, 1].mean().item()
+        accuracy = (probs[:, 1] > probs[:, 0]).float().mean().item()
+
+        print(f"   Attempt {attempt} Result: Sep={separation:.4f}, Acc={accuracy * 100:.1f}%")
+
+        # Check if we've achieved good discrimination
+        if separation < -0.2 and accuracy > 0.85:
+            print(f"✅ SUCCESS: Achieved target discrimination after {attempt} attempts!")
+            return current_logits
+        elif attempt == max_attempts:
+            print(f"⚠️  MAX ATTEMPTS REACHED: Using best available correction")
+            return current_logits
+
+    return current_logits
+
+
+def generate_features_and_inbatch(
         neg_pkl_file, task_type, bs, teacher_max_seq_length, num_shards, id_shard, finetuned_model_path
 ):
-    """🚀 MEMORY OPTIMIZED VERSION: Prevents GPU crashes"""
     # Add counter initialization
     counter_stats = {
         'total_samples': 0,
@@ -325,7 +372,7 @@ def generate_features_and_inbatch_memory_optimized(
             doc_list = [x[0] if isinstance(x, tuple) else x for x in bm25_dict[query]]
             len_dict[i] = len(doc_list)
             if task_type == "context":
-                qry_doc_list = [mmarco_template_context(query, d) for d in doc_list]
+                qry_doc_list = [covid_template_context(query, d) for d in doc_list]
             else:
                 raise ValueError(f"Unsupported task_type: {task_type}")
             all_sample_list.extend(qry_doc_list)
@@ -341,13 +388,17 @@ def generate_features_and_inbatch_memory_optimized(
     embed_model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2').cuda()
     embed_model.eval()
 
-    # 🚀 MEMORY OPTIMIZATION: Process features without storing all batches
-    print("Generating features with MEMORY-OPTIMIZED BERT pooling...")
-    feature_dict = {f"global_rank{id_shard}": []}
-    all_features_combined_list = []  # Store as list of numpy arrays to save memory
+    # Generate features with simple BERT pooling
+    print("Generating features with simple BERT pooling...")
+    all_feature_batches = []
+    feature_dict = {}
+
+    # Initialize feature counter
+    feature_batch_count = 0
 
     with torch.no_grad():
-        for start_idx in tqdm(range(0, len(all_sample_list), bs), desc="Generating OPTIMIZED BERT features"):
+        # Process in smaller batches for stability
+        for start_idx in tqdm(range(0, len(all_sample_list), bs), desc="Generating BERT features"):
             end_idx = min(start_idx + bs, len(all_sample_list))
             batch_texts = all_sample_list[start_idx:end_idx]
 
@@ -361,30 +412,25 @@ def generate_features_and_inbatch_memory_optimized(
             ).to('cuda')
 
             outputs = embed_model(**inputs)
+
+            # Use simple embedding generation (no enhancement)
             embeddings = get_simple_embeddings(outputs, inputs['attention_mask'])
             embeddings = F.normalize(embeddings, p=2, dim=1)
 
-            # 🚀 OPTIMIZATION 1: Convert to numpy immediately and clear GPU memory
-            embeddings_np = embeddings.cpu().numpy().astype(np.float16)  # Use float16 to save memory
-            all_features_combined_list.append(embeddings_np)
+            all_feature_batches.append(embeddings.cpu().to(torch.float16))
 
-            # 🚀 OPTIMIZATION 2: Compute similarity in smaller chunks
+            # Build feature similarity matrix for this batch
             feature_similarity = torch.mm(embeddings, embeddings.T)
+            if f"global_rank{id_shard}" not in feature_dict:
+                feature_dict[f"global_rank{id_shard}"] = []
             feature_dict[f"global_rank{id_shard}"].append(feature_similarity.cpu())
 
             # Count feature entries
+            feature_batch_count += 1
             counter_stats['feature_entries'] += embeddings.size(0)
 
-            # 🚀 OPTIMIZATION 3: Explicitly clear GPU memory
-            del inputs, outputs, embeddings, feature_similarity
-            torch.cuda.empty_cache()
-
-    # 🚀 OPTIMIZATION 4: Reconstruct features from numpy arrays when needed
-    print("Reconstructing combined features from numpy arrays...")
-    all_features_combined = np.concatenate(all_features_combined_list, axis=0)
-    all_features_combined = torch.from_numpy(all_features_combined).float()
-
     print(f"📊 Feature Generation Complete:")
+    print(f"   • Total feature batches: {feature_batch_count}")
     print(f"   • Total feature entries: {counter_stats['feature_entries']}")
     print(f"   • Feature dict entries: {len(feature_dict.get(f'global_rank{id_shard}', []))}")
 
@@ -393,13 +439,14 @@ def generate_features_and_inbatch_memory_optimized(
     all_logits = get_distilbert_classification_logits(
         all_sample_list,
         finetuned_model_path=finetuned_model_path,
-        batch_size=bs,  # Use the optimized batch size
+        batch_size=bs,
         max_length=teacher_max_seq_length
     )
 
     all_logits = apply_quick_negative_fix(all_logits)
 
     counter_stats['logit_entries'] = len(all_logits)
+    logit_batch_count = len(all_logits) // bs
 
     # 🔥 CRITICAL: Analyze negative logit quality BEFORE proceeding
     quality_analysis = analyze_negative_logit_quality_enhanced(all_logits)
@@ -409,10 +456,16 @@ def generate_features_and_inbatch_memory_optimized(
         print("🚨🚨🚨 CRITICAL ISSUE: Negative logits show POSITIVE discrimination!")
         print("🚨 This means your negative samples might be contaminated with positives")
         print("🚨 Check your BM25 negative generation pipeline")
+        # You might want to exit here or implement a fix
 
     # Build in-batch logits
     print("Building in-batch similarities...")
-    inbatch_dict = {f"global_rank{id_shard}": []}
+    inbatch_dict = {}
+    inbatch_batch_count = 0
+
+    # 🔥 CRITICAL FIX: Pre-initialize the inbatch_dict list
+    if f"global_rank{id_shard}" not in inbatch_dict:
+        inbatch_dict[f"global_rank{id_shard}"] = []
 
     # Process logits in batches to build in-batch similarities
     all_logits_tensor = torch.tensor(all_logits)
@@ -438,14 +491,14 @@ def generate_features_and_inbatch_memory_optimized(
 
             # Count inbatch entries
             counter_stats['inbatch_entries'] += inbatch_logits_tensor.size(0) * inbatch_logits_tensor.size(1)
-
-        # 🚀 MEMORY OPTIMIZATION: Clear memory
-        del batch_logits, inbatch_logits, inbatch_logits_tensor
-        torch.cuda.empty_cache()
+            inbatch_batch_count += 1
 
     print(f"📊 Logit Generation Complete:")
+    print(f"   • Total logit batches: {logit_batch_count}")
     print(f"   • Total logit entries: {counter_stats['logit_entries']}")
+    print(f"   • Total in-batch batches: {inbatch_batch_count}")
     print(f"   • Total in-batch entries: {counter_stats['inbatch_entries']}")
+    print(f"   • In-batch dict entries: {len(inbatch_dict.get(f'global_rank{id_shard}', []))}")
 
     # Rebuilding results with diversity check
     print("Rebuilding results with diversity check...")
@@ -455,25 +508,12 @@ def generate_features_and_inbatch_memory_optimized(
     # Count query entries
     query_entry_count = 0
 
-    # 🚀 OPTIMIZATION: Calculate feature diversity in chunks to save memory
-    print("Calculating feature diversity in chunks...")
-    chunk_size = 10000  # Process 10k features at a time
-    feature_similarities = []
+    # Basic feature diversity check
+    all_features_combined = torch.cat(all_feature_batches, dim=0).float()
+    feature_similarity_matrix = torch.mm(all_features_combined, all_features_combined.T)
+    mask = ~torch.eye(feature_similarity_matrix.size(0)).bool()
+    avg_feature_similarity = feature_similarity_matrix[mask].mean().item()
 
-    for i in range(0, all_features_combined.size(0), chunk_size):
-        end_idx = min(i + chunk_size, all_features_combined.size(0))
-        chunk = all_features_combined[i:end_idx]
-
-        # Calculate intra-chunk similarities
-        chunk_similarity = torch.mm(chunk, chunk.T)
-        mask = ~torch.eye(chunk.size(0)).bool()
-        chunk_avg_sim = chunk_similarity[mask].mean().item()
-        feature_similarities.append(chunk_avg_sim)
-
-        del chunk, chunk_similarity
-        torch.cuda.empty_cache()
-
-    avg_feature_similarity = np.mean(feature_similarities)
     print(f"✅ Teacher feature similarity: {avg_feature_similarity:.4f}")
 
     if avg_feature_similarity < 0.3:
@@ -483,7 +523,6 @@ def generate_features_and_inbatch_memory_optimized(
     else:
         print("⚠️  Feature diversity could be improved")
 
-    # Rebuild final results dictionary
     for i, query in tqdm(enumerate(total_keys), total=len(total_keys), desc="Finalizing"):
         if shard_size * id_shard <= i < shard_size * (id_shard + 1):
             end = start + len_dict[i]
@@ -500,19 +539,15 @@ def generate_features_and_inbatch_memory_optimized(
     # Add quality metrics to counter stats
     counter_stats['logit_quality'] = quality_analysis
 
-    # 🚀 FINAL MEMORY CLEANUP
-    del all_features_combined, all_logits_tensor, all_features_combined_list
-    torch.cuda.empty_cache()
-    gc.collect()
-
     # Final statistics summary
-    print(f"\n🎉 FINAL GENERATION STATISTICS (MEMORY OPTIMIZED):")
+    print(f"\nFINAL GENERATION STATISTICS:")
     print(f"   • Total samples processed: {counter_stats['total_samples']}")
     print(f"   • Query entries in res_dict: {counter_stats['query_entries']}")
     print(f"   • Feature entries created: {counter_stats['feature_entries']}")
     print(f"   • Logit entries created: {counter_stats['logit_entries']}")
     print(f"   • In-batch entries created: {counter_stats['inbatch_entries']}")
-    print(f"   • Feature similarity: {avg_feature_similarity:.4f}")
+    print(f"   • Feature dict batches: {len(feature_dict.get(f'global_rank{id_shard}', []))}")
+    print(f"   • In-batch dict batches: {len(inbatch_dict.get(f'global_rank{id_shard}', []))}")
     print(f"   • Logit quality: {quality_analysis['quality'].upper()}")
 
     return res_dict, feature_dict, inbatch_dict, counter_stats
@@ -520,21 +555,21 @@ def generate_features_and_inbatch_memory_optimized(
 
 if __name__ == "__main__":
     # 🔥 CRITICAL: Path to your FINE-TUNED DistilBERT model
-    FINETUNED_MODEL_PATH = "./distilbert-mmarco-classifier-final"
+    FINETUNED_MODEL_PATH = "./distilbert-covid-classifier-final"
 
     task_type = "context"
-    batch_size = 16  # 🚀 REDUCED from 16 to 8 for memory stability
+    batch_size = 16
     teacher_max_seq_length = 256
     num_shards = 1
     id_shard = 0
 
     # Training split
     print("\n" + "=" * 80)
-    print("🚀 GENERATING NEGATIVES WITH MEMORY-OPTIMIZED PIPELINE - TRAIN SPLIT")
+    print("🔥 GENERATING NEGATIVES WITH FINE-TUNED DISTILBERT - TRAIN SPLIT")
     print("=" * 80)
 
-    generated_logits, features_dict, inbatch_dict, counters = generate_features_and_inbatch_memory_optimized(
-        neg_pkl_file="../outputs/neg_mmarco/train/query_hard_negatives.pkl",
+    generated_logits, features_dict, inbatch_dict, counters = generate_features_and_inbatch(
+        neg_pkl_file="../outputs/neg_covid/train/query_hard_negatives.pkl",
         task_type=task_type,
         bs=batch_size,
         teacher_max_seq_length=teacher_max_seq_length,
@@ -545,22 +580,22 @@ if __name__ == "__main__":
 
     print(f"📊 TRAIN Split Counters: {counters}")
 
-    write_pickle(generated_logits, "../outputs/logits/mmarco_train_neg_logits.pkl")
-    print("Saved train logits to ../outputs/logits/mmarco_train_neg_logits.pkl")
+    write_pickle(generated_logits, "../outputs/logits/covid_train_neg_logits.pkl")
+    print("Saved train logits to ../outputs/logits/covid_train_neg_logits.pkl")
 
-    write_pickle(features_dict, "../outputs/features/mmarco_train_features.pkl")
-    print("Saved train features to ../outputs/features/mmarco_train_features.pkl")
+    write_pickle(features_dict, "../outputs/features/covid_train_features.pkl")
+    print("Saved train features to ../outputs/features/covid_train_features.pkl")
 
-    write_pickle(inbatch_dict, "../outputs/inbatch/mmarco_train_inbatch.pkl")
-    print("Saved train in-batch similarities to ../outputs/inbatch/mmarco_train_inbatch.pkl")
+    write_pickle(inbatch_dict, "../outputs/inbatch/covid_train_inbatch.pkl")
+    print("Saved train in-batch similarities to ../outputs/inbatch/covid_train_inbatch.pkl")
 
     # Validation split
     print("\n" + "=" * 80)
-    print("🚀 GENERATING NEGATIVES WITH MEMORY-OPTIMIZED PIPELINE - VAL SPLIT")
+    print("🔥 GENERATING NEGATIVES WITH FINE-TUNED DISTILBERT - VAL SPLIT")
     print("=" * 80)
 
-    generated_logits, features_dict, inbatch_dict, counters = generate_features_and_inbatch_memory_optimized(
-        neg_pkl_file="../outputs/neg_mmarco/val/query_hard_negatives.pkl",
+    generated_logits, features_dict, inbatch_dict, counters = generate_features_and_inbatch(
+        neg_pkl_file="../outputs/neg_covid/val/query_hard_negatives.pkl",
         task_type=task_type,
         bs=batch_size,
         teacher_max_seq_length=teacher_max_seq_length,
@@ -571,15 +606,14 @@ if __name__ == "__main__":
 
     print(f"📊 VAL Split Counters: {counters}")
 
-    write_pickle(generated_logits, "../outputs/logits/mmarco_val_neg_logits.pkl")
-    print("Saved val logits to ../outputs/logits/mmarco_val_neg_logits.pkl")
+    write_pickle(generated_logits, "../outputs/logits/covid_val_neg_logits.pkl")
+    print("Saved val logits to ../outputs/logits/covid_val_neg_logits.pkl")
 
-    write_pickle(features_dict, "../outputs/features/mmarco_val_features.pkl")
-    print("Saved val features to ../outputs/features/mmarco_val_features.pkl")
+    write_pickle(features_dict, "../outputs/features/covid_val_features.pkl")
+    print("Saved val features to ../outputs/features/covid_val_features.pkl")
 
-    write_pickle(inbatch_dict, "../outputs/inbatch/mmarco_val_inbatch.pkl")
-    print("Saved val in-batch similarities to ../outputs/inbatch/mmarco_val_inbatch.pkl")
+    write_pickle(inbatch_dict, "../outputs/inbatch/covid_val_inbatch.pkl")
+    print("Saved val in-batch similarities to ../outputs/inbatch/covid_val_inbatch.pkl")
 
-    print("\n🎉🚀 COMPLETED: Both splits processed with MEMORY-OPTIMIZED pipeline!")
-    print("✅ NO GPU CRASHES EXPECTED!")
-    print("✅ NEGATIVE LOGITS HAVE PROPER DISCRIMINATION!")
+    print("\n🎉🔥 COMPLETED: Both splits processed with CONSISTENT fine-tuned DistilBERT!")
+    print("✅ NEGATIVE LOGITS SHOULD NOW HAVE PROPER DISCRIMINATION!")

@@ -1,30 +1,41 @@
-import json
+import pandas as pd
+import os
 
-def print_first_n_records_unstructured(path, n=10):
-    print(f"\n--- Showing first {n} unstructured records from file: {path} ---")
-    with open(path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+def show_first_n_tsv_table(path, n=3, max_len=100):
+    """
+    Display the first N records of a TSV file in table format.
+    Truncates long text fields for readability.
+    """
+    print(f"\n--- Inspecting TSV file: {path} ---")
 
-    if isinstance(data, list):
-        # Case: Top-level JSON is a list
-        for i, item in enumerate(data[:n]):
-            val_str = json.dumps(item, indent=2)
-            if len(val_str) > 500:
-                val_str = val_str[:500] + "..."
-            print(f"\nRecord {i+1}:\n{val_str}")
-    elif isinstance(data, dict):
-        # Case: Top-level JSON is a dict
-        for i, (key, val) in enumerate(data.items()):
-            if i >= n:
-                break
-            val_str = json.dumps(val, indent=2)
-            if len(val_str) > 500:
-                val_str = val_str[:500] + "..."
-            print(f"\nKey: {key}\nValue:\n{val_str}")
-    else:
-        print("Unsupported JSON format (not a list or dict at the top level)")
+    if not os.path.exists(path):
+        print(f"❌ File not found: {path}")
+        return
 
-# Usage example
-# print_first_n_records_unstructured('train_v2.1.json')
-print_first_n_records_unstructured('dev_v2.1.json')
-# print_first_n_records_unstructured('eval_v2.1_public.json')
+    try:
+        df = pd.read_csv(path, sep='\t')
+    except Exception as e:
+        print(f"❌ Error reading TSV file: {e}")
+        return
+
+    if df.empty:
+        print("⚠️ File is empty — no records to display.")
+        return
+
+    # Truncate long text fields
+    df_trunc = df.head(n).copy()
+    for col in df_trunc.columns:
+        df_trunc[col] = df_trunc[col].astype(str).apply(lambda x: x[:max_len] + '...' if len(x) > max_len else x)
+
+    print(f"✅ First {min(n, len(df_trunc))} records:")
+    print(df_trunc.to_string(index=False))
+    print(f"\n📊 Total rows in file: {len(df):,}\n")
+
+
+# ===============================
+# Example usage for train folder
+# ===============================
+base_path = '/root/pycharm_semanticsearch/dataset/ms_marco/test'
+
+for fname in ['queries.tsv', 'qrels.tsv', 'corpus.tsv', 'positives.tsv']:
+    show_first_n_tsv_table(os.path.join(base_path, fname))

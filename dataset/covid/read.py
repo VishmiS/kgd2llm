@@ -1,49 +1,41 @@
 import pandas as pd
+import os
 
-def print_first_n_records_parquet(path, n=1, max_len=500):
+def show_first_n_tsv_table(path, n=3, max_len=100):
     """
-    Print summary and first N records from a Parquet file.
-    Shows total row count, columns, and truncated sample values.
+    Display the first N records of a TSV file in table format.
+    Truncates long text fields for readability.
     """
-    print(f"\n--- Inspecting Parquet file: {path} ---")
+    print(f"\n--- Inspecting TSV file: {path} ---")
+
+    if not os.path.exists(path):
+        print(f"❌ File not found: {path}")
+        return
 
     try:
-        # Read parquet into DataFrame
-        df = pd.read_parquet(path)
+        df = pd.read_csv(path, sep='\t')
     except Exception as e:
-        print(f"❌ Error reading parquet file: {e}")
+        print(f"❌ Error reading TSV file: {e}")
         return
 
-    num_rows, num_cols = df.shape
-    print(f"✅ Loaded Parquet file successfully!")
-    print(f"➡️  Rows: {num_rows:,}")
-    print(f"➡️  Columns: {num_cols}")
-    print(f"➡️  Column names: {list(df.columns)}\n")
-
-    if num_rows == 0:
-        print("⚠️  File is empty — no records to display.")
+    if df.empty:
+        print("⚠️ File is empty — no records to display.")
         return
 
-    # Display first N rows
-    sample = df.head(n)
-    print(f"--- Showing first {min(n, num_rows)} records ---")
+    # Truncate long text fields
+    df_trunc = df.head(n).copy()
+    for col in df_trunc.columns:
+        df_trunc[col] = df_trunc[col].astype(str).apply(lambda x: x[:max_len] + '...' if len(x) > max_len else x)
 
-    for i, row in enumerate(sample.itertuples(index=False), start=1):
-        print(f"\nRecord {i}:")
-        for col, val in zip(df.columns, row):
-            val_str = str(val)
-            if len(val_str) > max_len:
-                val_str = val_str[:max_len] + "..."
-            print(f"  {col}: {val_str}")
-
-    print("\n--- End of sample ---")
-    print(f"📊 Total rows in file: {num_rows:,}\n")
+    print(f"✅ First {min(n, len(df_trunc))} records:")
+    print(df_trunc.to_string(index=False))
+    print(f"\n📊 Total rows in file: {len(df):,}\n")
 
 
 # ===============================
-# Example usage:
+# Example usage for train folder
 # ===============================
-print_first_n_records_parquet('/root/pycharm_semanticsearch/dataset/covid/train/queries.parquet')
-print_first_n_records_parquet('/root/pycharm_semanticsearch/dataset/covid/dev/queries.parquet')
-# print_first_n_records_parquet('/root/pycharm_semanticsearch/dataset/covid/train/qrels.parquet')
-# print_first_n_records_parquet('/root/pycharm_semanticsearch/dataset/covid/docs/docs.parquet')
+base_path = '/root/pycharm_semanticsearch/dataset/covid/test'
+
+for fname in ['queries.tsv', 'qrels.tsv', 'corpus.tsv', 'positives.tsv', 'summary.tsv']:
+    show_first_n_tsv_table(os.path.join(base_path, fname))

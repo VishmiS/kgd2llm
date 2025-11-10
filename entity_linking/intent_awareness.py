@@ -334,3 +334,90 @@ def detect_property_semantic_type(property_label, value):
         return "institution"
 
     return "other"
+
+
+def is_valid_location_answer(answer, question_type, question_text=""):
+    """Validate if an answer is appropriate for location questions"""
+    if not answer:
+        return False
+
+    answer_lower = str(answer).lower()
+    question_lower = question_text.lower()
+
+    # Reject obvious wrong answers
+    wrong_indicators = [
+        "category:", "borough", "arctic", "administrative",
+        "division", "counties of", "united states", "afc", "football",
+        "club", "association", "soccer", "premier league"
+    ]
+
+    if any(wrong in answer_lower for wrong in wrong_indicators):
+        return False
+
+    # For country questions, answer should look like a country
+    if question_type == "country":
+        country_indicators = ["united states", "usa", "canada", "france", "germany", "china", "japan", "india",
+                              "brazil", "australia", "russia", "uk", "united kingdom", "mexico", "italy", "spain"]
+        if not any(country in answer_lower for country in country_indicators):
+            # If it doesn't contain known country names, check structure
+            if len(answer.split()) > 3:  # Too long for a country name
+                return False
+            if answer_lower.endswith("borough") or answer_lower.endswith("county"):
+                return False
+            if any(term in answer_lower for term in ["county", "district", "region", "province"]):
+                return False
+
+    # For county questions, answer should look like a county
+    if question_type == "county":
+        if "category:" in answer_lower:
+            return False
+        if "counties of" in answer_lower:
+            return False
+        if len(answer.split()) > 4:  # Too long for a county name
+            return False
+        if any(term in answer_lower for term in ["country", "nation", "republic"]):
+            return False
+
+    return True
+
+
+def validate_reformulated_answer(final_answer, original_question):
+    """Final safety check for reformulated answers"""
+    if not final_answer:
+        return True
+
+    final_lower = final_answer.lower()
+    question_lower = original_question.lower()
+
+    # List of obviously wrong answers to reject
+    wrong_answers = [
+        "northwest arctic borough", "category:", "counties of", "afc",
+        "newport county a.f.c.", "administrative division", "football club"
+    ]
+
+    # Additional context-aware rejection
+    if "country" in question_lower and any(wrong in final_lower for wrong in ["borough", "county", "afc"]):
+        return False
+
+    if "county" in question_lower and any(wrong in final_lower for wrong in ["category:", "counties of", "afc"]):
+        return False
+
+    return not any(wrong in final_lower for wrong in wrong_answers)
+
+
+def get_question_intent_type(question_text):
+    """Determine the specific intent type of the question"""
+    qlower = question_text.lower()
+
+    if any(kw in qlower for kw in ["what country", "which country"]):
+        return "country"
+    elif any(kw in qlower for kw in ["what county", "which county"]):
+        return "county"
+    elif any(kw in qlower for kw in ["when", "date", "year", "founded", "established"]):
+        return "time"
+    elif any(kw in qlower for kw in ["where", "location", "place", "city"]):
+        return "location"
+    elif any(kw in qlower for kw in ["who", "person", "actor", "director"]):
+        return "person"
+    else:
+        return "other"

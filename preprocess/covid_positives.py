@@ -12,7 +12,7 @@ import random
 import os
 
 
-def mmarco_template_context(query, passage):
+def covid_template_context(query, passage):
     return (
         f"#Q describes a user question. #A describes a web passage. "
         f"Are they related such that #A correctly answers #Q? Answer Can or Cannot.\n"
@@ -32,7 +32,7 @@ def get_simple_embeddings(outputs, attention_mask):
     return embeddings
 
 
-class WebQuestionDataset(torch.utils.data.Dataset):
+class CovidDataset(torch.utils.data.Dataset):
     def __init__(self, encodings, labels):
         self.encodings = encodings
         self.labels = labels
@@ -72,7 +72,7 @@ def create_finetuning_data_optimized(positive_tsv_path, num_positive_samples=500
             question = row['sentence1'].strip()
             answer = row['sentence2'].strip()
             if question and answer:
-                template = mmarco_template_context(question, answer)
+                template = covid_template_context(question, answer)
                 positive_pairs.append((template, 0))  # 0 = "Can" answer
 
     print(f"Loaded {len(positive_pairs)} positive examples (subset)")
@@ -112,7 +112,7 @@ def create_finetuning_data_optimized(positive_tsv_path, num_positive_samples=500
         a = random.choice(unique_answers)
 
         # Create template and check if it's a positive pair
-        template = mmarco_template_context(q, a)
+        template = covid_template_context(q, a)
         is_positive = any(template == pos_template for pos_template, _ in positive_pairs)
 
         if not is_positive:
@@ -135,7 +135,7 @@ def create_finetuning_data_optimized(positive_tsv_path, num_positive_samples=500
 
 
 def fine_tune_distilbert_classifier(train_texts, train_labels, val_texts=None, val_labels=None,
-                                    output_dir='./distilbert-mmarco-classifier'):
+                                    output_dir='./distilbert-covid-classifier'):
     """Fine-tune DistilBERT for faster training"""
 
     print("Loading DistilBERT tokenizer and model for faster fine-tuning...")
@@ -154,7 +154,7 @@ def fine_tune_distilbert_classifier(train_texts, train_labels, val_texts=None, v
         max_length=256
     )
 
-    train_dataset = WebQuestionDataset(train_encodings, train_labels)
+    train_dataset = CovidDataset(train_encodings, train_labels)
 
     # Tokenize validation data if provided
     if val_texts is not None and val_labels is not None:
@@ -165,7 +165,7 @@ def fine_tune_distilbert_classifier(train_texts, train_labels, val_texts=None, v
             padding=True,
             max_length=256
         )
-        val_dataset = WebQuestionDataset(val_encodings, val_labels)
+        val_dataset = CovidDataset(val_encodings, val_labels)
     else:
         val_dataset = None
         print("No validation data provided")
@@ -245,18 +245,14 @@ def get_finetuned_distilbert_classification_logits(texts, model_path, batch_size
             probs = torch.softmax(logits.float(), dim=-1)
             all_logits.extend(probs.cpu().numpy().tolist())
 
-            # 🚀 ADD MEMORY CLEARING
-            del inputs, outputs, logits, probs
-            torch.cuda.empty_cache()
-
     return all_logits
 
 
 def generate_positive_logits_and_features_distilbert(tsv_path, output_path, finetuned_model_path, batch_size=32,
                                                      max_length=256):
-    """🚀 MEMORY OPTIMIZED: Use fine-tuned DistilBERT classifier with memory optimizations"""
+    """DISTILBERT VERSION: Use fine-tuned DistilBERT classifier for faster performance"""
 
-    # Load data (same as before)
+    # Load data
     pairs = []
     question_count = defaultdict(int)
 
@@ -276,6 +272,8 @@ def generate_positive_logits_and_features_distilbert(tsv_path, output_path, fine
     duplicates = {q: count for q, count in question_count.items() if count > 1}
     if duplicates:
         print(f"Questions with multiple answers: {len(duplicates)}")
+        for q, count in list(duplicates.items())[:3]:
+            print(f"  '{q}' -> {count} answers")
 
     # Use BERT for feature extraction
     print("Loading sentence-transformers model for feature extraction...")
@@ -285,7 +283,7 @@ def generate_positive_logits_and_features_distilbert(tsv_path, output_path, fine
 
     # 🔥 DISTILBERT: Use fine-tuned DistilBERT classifier
     print("Using fine-tuned DistilBERT classifier for faster logit generation...")
-    all_templates = [mmarco_template_context(q, a) for q, a in pairs]
+    all_templates = [covid_template_context(q, a) for q, a in pairs]
     all_logits = get_finetuned_distilbert_classification_logits(
         all_templates,
         finetuned_model_path,
@@ -293,18 +291,14 @@ def generate_positive_logits_and_features_distilbert(tsv_path, output_path, fine
         max_length=max_length
     )
 
-    # 🚀 MEMORY OPTIMIZED: Generate features without storing all batches
-    print("Generating features with MEMORY-OPTIMIZED approach...")
+    # Generate features from answers
+    print("Generating features from answers...")
+    all_features = []
     answers_only = [a for q, a in pairs]
-    feature_dict = {}  # Store features directly in output dict
-    all_features_list = []  # Store as list for similarity calculation
 
     with torch.no_grad():
-        feature_idx = 0
         for i in tqdm(range(0, len(answers_only), batch_size), desc="Answer features"):
             batch_answers = answers_only[i:i + batch_size]
-            batch_pairs = pairs[i:i + batch_size]  # Get corresponding pairs
-
             inputs = embed_tokenizer(batch_answers, padding=True, truncation=True,
                                      max_length=max_length, return_tensors="pt").to('cuda')
             outputs = embed_model(**inputs)
@@ -312,64 +306,41 @@ def generate_positive_logits_and_features_distilbert(tsv_path, output_path, fine
             # Use simple embedding generation (no enhancement)
             embeddings = get_simple_embeddings(outputs, inputs['attention_mask'])
             features = F.normalize(embeddings, p=2, dim=1)
-
-            # 🚀 OPTIMIZATION 1: Convert to numpy immediately and store directly
-            features_np = features.cpu().numpy().astype(np.float16)  # Use float16
-
-            # Store features directly in output dict
-            for j, (question, answer) in enumerate(batch_pairs):
-                pair_key = (question, answer)
-                feature_dict[pair_key] = features_np[j].tolist()
-                all_features_list.append(features_np[j])  # Keep for similarity calculation
-
-            # 🚀 OPTIMIZATION 2: Clear GPU memory
-            del inputs, outputs, embeddings, features, features_np
-            torch.cuda.empty_cache()
-            feature_idx += len(batch_pairs)
-
-    # 🚀 OPTIMIZATION 3: Calculate similarity from numpy arrays (memory efficient)
-    print("Calculating feature similarity...")
-    if all_features_list:
-        all_features_array = np.array(all_features_list)
-        # Calculate similarity in chunks to avoid memory issues
-        chunk_size = min(5000, len(all_features_array))
-        feature_similarities = []
-
-        for i in range(0, len(all_features_array), chunk_size):
-            end_idx = min(i + chunk_size, len(all_features_array))
-            chunk = torch.from_numpy(all_features_array[i:end_idx]).float()
-
-            chunk_similarity = torch.mm(chunk, chunk.T)
-            mask = ~torch.eye(chunk.size(0)).bool()
-            chunk_avg_sim = chunk_similarity[mask].mean().item()
-            feature_similarities.append(chunk_avg_sim)
-
-            del chunk, chunk_similarity
-            torch.cuda.empty_cache()
-
-        avg_similarity = np.mean(feature_similarities)
-    else:
-        avg_similarity = 0.0
+            all_features.append(features.cpu().to(torch.float16))
 
     # 🔥 ENHANCED: Store logits keyed by (question, answer) pairs with quality metrics
     output_dict = {
         'logits': {},
-        'features': feature_dict,  # 🚀 Use the pre-populated feature dict
+        'features': {},
         'metadata': {
             'total_pairs': len(pairs),
             'unique_questions': len(question_count),
             'questions_with_multiple_answers': len(duplicates),
-            'feature_similarity': avg_similarity,
+            'feature_similarity': 0.0,
             'logit_quality': {},
             'key_format': 'question_answer_pair',
             'model_used': 'fine-tuned-distilbert'
         }
     }
 
-    # 🚀 OPTIMIZATION: Store logits (features already stored)
+    all_features_combined = torch.cat(all_features, dim=0) if all_features else torch.tensor([])
+
+    # Store logits and features keyed by (question, answer) pairs
     for idx, ((question, answer), logit) in enumerate(zip(pairs, all_logits)):
+        # Key by the actual pair for exact matching
         pair_key = (question, answer)
         output_dict['logits'][pair_key] = logit
+
+        if idx < len(all_features_combined):
+            output_dict['features'][pair_key] = all_features_combined[idx].numpy().tolist()
+
+    # Calculate feature similarity
+    if len(all_features_combined) > 0:
+        features_tensor = all_features_combined.float()
+        similarity_matrix = torch.mm(features_tensor, features_tensor.T)
+        mask = ~torch.eye(similarity_matrix.size(0)).bool()
+        avg_similarity = similarity_matrix[mask].mean().item()
+        output_dict['metadata']['feature_similarity'] = avg_similarity
 
     # 🔥 ENHANCED: Calculate logit quality metrics
     all_logits_tensor = torch.tensor(all_logits)
@@ -396,7 +367,7 @@ def generate_positive_logits_and_features_distilbert(tsv_path, output_path, fine
     with open(output_path, 'wb') as f:
         pickle.dump(output_dict, f)
 
-    # 🔥 ENHANCED QUALITY REPORTING (same as before)
+    # 🔥 ENHANCED QUALITY REPORTING
     print(f"\n🎯 DISTILBERT POSITIVE LOGIT QUALITY ANALYSIS:")
     print(f"   Average 'Can' probability: {avg_can:.4f}")
     print(f"   Average 'Cannot' probability: {avg_cannot:.4f}")
@@ -448,68 +419,56 @@ def generate_positive_logits_and_features_distilbert(tsv_path, output_path, fine
 
 
 def create_simple_positive_logits_final():
-    """Create training-compatible version - SIMPLE FLAT DICTIONARY FORMAT"""
+    """Create training-compatible version with proper (question, answer) keys"""
 
     for split in ['train', 'val']:
-        input_path = f'../outputs/pos_emb/mmarco_{split}_pos_emb.pkl'
-        output_path = f'../outputs/pos_emb/mmarco_{split}_pos_logits.pkl'
+        input_path = f'../outputs/pos_emb/covid_{split}_pos_emb_distilbert.pkl'
+        output_path = f'../outputs/pos_emb/covid_{split}_pos_logits_distilbert.pkl'
 
         print(f"\n🔄 Creating training logits for {split}...")
 
-        # Check if input file exists
-        if not os.path.exists(input_path):
-            print(f"❌ Input file not found: {input_path}")
-            print(f"   Please make sure the main generation completed successfully.")
-            continue
+        with open(input_path, 'rb') as f:
+            data = pickle.load(f)
 
-        try:
-            with open(input_path, 'rb') as f:
-                data = pickle.load(f)
+        # For training: extract logits and create flat dictionary with (question, answer) keys
+        training_logits = {}
 
-            # 🔥 CRITICAL FIX: Create FLAT dictionary (not nested)
-            # Extract logits directly into a flat dict that your dataset expects
-            training_logits = {}
+        # Check if we have the new format with pair keys
+        if data['logits'] and isinstance(next(iter(data['logits'].keys())), tuple):
+            # Already in (question, answer) format - just extract the logits
+            for pair_key, logit in data['logits'].items():
+                training_logits[pair_key] = logit
+        else:
+            # Old format - need to reconstruct pairs (this shouldn't happen with the new code)
+            print(f"⚠️  Old format detected for {split}, reconstructing pairs...")
+            # You would need the original TSV data to reconstruct pairs properly
 
-            if 'logits' in data and data['logits']:
-                # Directly use the logits dict - this is what your dataset wants
-                training_logits = data['logits']
-                print(f"✅ Extracted {len(training_logits)} logits for training")
-            else:
-                print(f"❌ No 'logits' found in {input_path}")
-                continue
+        with open(output_path, 'wb') as f:
+            pickle.dump(training_logits, f)
 
-            # 🔥 SIMPLE: Save as FLAT dictionary (no nesting)
-            # This is the format your dataset code expects: {(question, answer): logit}
-            with open(output_path, 'wb') as f:
-                pickle.dump(training_logits, f)  # 🔥 Just save the flat dict!
+        # Calculate training logit quality
+        all_training_logits = list(training_logits.values())
+        if all_training_logits:
+            logits_tensor = torch.tensor(all_training_logits)
+            can_probs = logits_tensor[:, 0]
+            cannot_probs = logits_tensor[:, 1]
+            separation = (can_probs - cannot_probs).mean().item()
+            accuracy = (can_probs > cannot_probs).float().mean().item()
 
-            # Calculate training logit quality
-            all_training_logits = list(training_logits.values())
-            if all_training_logits:
-                logits_tensor = torch.tensor(all_training_logits)
-                can_probs = logits_tensor[:, 0]
-                cannot_probs = logits_tensor[:, 1]
-                separation = (can_probs - cannot_probs).mean().item()
-                accuracy = (can_probs > cannot_probs).float().mean().item()
+            print(f"📊 Training Logit Quality for {split}:")
+            print(f"   • Separation: {separation:.4f}")
+            print(f"   • Accuracy: {accuracy * 100:.1f}%")
+            print(f"   • Total pairs: {len(training_logits)}")
 
-                print(f"📊 Training Logit Quality for {split}:")
-                print(f"   • Separation: {separation:.4f}")
-                print(f"   • Accuracy: {accuracy * 100:.1f}%")
-                print(f"   • Total pairs: {len(training_logits)}")
+        print(f"✅ Saved {len(training_logits)} training logits to {output_path}")
 
-            print(f"✅ Saved {len(training_logits)} training logits to {output_path} (FLAT FORMAT)")
-
-            # Show samples
-            print(f"📋 Sample training logits for {split}:")
-            for i, (pair_key, logit) in enumerate(list(training_logits.items())[:2]):
-                question, answer = pair_key
-                can_prob, cannot_prob = logit
-                print(f"  {i + 1}. Q: '{question[:30]}...' -> A: '{answer[:30]}...'")
-                print(f"     Logit: Can={can_prob:.4f}, Cannot={cannot_prob:.4f}")
-
-        except Exception as e:
-            print(f"❌ Error processing {split}: {e}")
-            continue
+        # Show samples
+        print(f"📋 Sample training logits for {split}:")
+        for i, (pair_key, logit) in enumerate(list(training_logits.items())[:2]):
+            question, answer = pair_key
+            can_prob, cannot_prob = logit
+            print(f"  {i + 1}. Q: '{question[:30]}...' -> A: '{answer[:30]}...'")
+            print(f"     Logit: Can={can_prob:.4f}, Cannot={cannot_prob:.4f}")
 
 
 def main():
@@ -520,16 +479,16 @@ def main():
 
     # Create smaller training data from train positives
     train_texts, train_labels = create_finetuning_data_optimized(
-        "../dataset/ms_marco/train/positives.tsv",
-        num_positive_samples=5000,  # Reduced for faster training
-        num_negative_samples=5000  # Reduced for faster training
+        "../dataset/covid/train/positives.tsv",
+        num_positive_samples=5000,    # Reduced from 38K to 5K
+        num_negative_samples=5000     # Reduced from 20K to 5K
     )
 
     # Create smaller validation data from val positives
     val_texts, val_labels = create_finetuning_data_optimized(
-        "../dataset/ms_marco/val/positives.tsv",
-        num_positive_samples=1000,  # Reduced for faster training
-        num_negative_samples=1000  # Reduced for faster training
+        "../dataset/covid/val/positives.tsv",
+        num_positive_samples=1000,    # Reduced from 4K to 1K
+        num_negative_samples=1000     # Reduced from 2K to 1K
     )
 
     # Fine-tune DistilBERT (much faster than BERT)
@@ -538,30 +497,28 @@ def main():
         train_labels,
         val_texts,
         val_labels,
-        output_dir='./distilbert-mmarco-classifier'
+        output_dir='./distilbert-covid-classifier'
     )
 
-    finetuned_model_path = './distilbert-mmarco-classifier-final'
+    finetuned_model_path = './distilbert-covid-classifier-final'
 
     print(f"\n🎯 Step 2: Generating logits with fine-tuned DistilBERT model...")
 
     # Generate logits with fine-tuned DistilBERT model
     train_output = generate_positive_logits_and_features_distilbert(
-        tsv_path="../dataset/ms_marco/train/positives.tsv",
-        # 🔥 UPDATED: Use the same output paths as your original code
-        output_path="../outputs/pos_emb/mmarco_train_pos_emb.pkl",
+        tsv_path="../dataset/covid/train/positives.tsv",
+        output_path="../outputs/pos_emb/covid_train_pos_emb_distilbert.pkl",
         finetuned_model_path=finetuned_model_path
     )
 
     print("\n=== VALIDATION GENERATION ===")
     val_output = generate_positive_logits_and_features_distilbert(
-        tsv_path="../dataset/ms_marco/val/positives.tsv",
-        # 🔥 UPDATED: Use the same output paths as your original code
-        output_path="../outputs/pos_emb/mmarco_val_pos_emb.pkl",
+        tsv_path="../dataset/covid/val/positives.tsv",
+        output_path="../outputs/pos_emb/covid_val_pos_emb_distilbert.pkl",
         finetuned_model_path=finetuned_model_path
     )
 
-    # Create training versions - this will now create files with original names
+    # Create training versions
     create_simple_positive_logits_final()
 
     # 🔥 FINAL COMPARISON SUMMARY
@@ -594,13 +551,6 @@ def main():
     print(f"Validation: {val_output['metadata']['total_pairs']} pairs")
     print(f"Fine-tuned model: {finetuned_model_path}")
     print("✅ Ready for training with fast fine-tuned DistilBERT classifier logits!")
-
-    # 🔥 ADDED: Show final file structure
-    print(f"\n📁 FINAL FILE STRUCTURE:")
-    print(f"   - ../outputs/pos_emb/mmarco_train_pos_emb.pkl (Full data with features)")
-    print(f"   - ../outputs/pos_emb/mmarco_val_pos_emb.pkl (Full data with features)")
-    print(f"   - ../outputs/pos_emb/mmarco_train_pos_logits.pkl (Training logits - FLAT DICT FORMAT)")
-    print(f"   - ../outputs/pos_emb/mmarco_val_pos_logits.pkl (Training logits - FLAT DICT FORMAT)")
 
 
 if __name__ == "__main__":

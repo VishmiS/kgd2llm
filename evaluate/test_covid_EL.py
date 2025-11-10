@@ -1,5 +1,5 @@
 # conda activate faiss-gpu-py38
-# python /root/pycharm_semanticsearch/evaluate/test_webq_EL.py
+# python /root/pycharm_semanticsearch/evaluate/test_covid_EL.py
 
 import sys, os
 import torch.nn.functional as F
@@ -36,20 +36,20 @@ peft_config = LoraConfig(
     task_type="FEATURE_EXTRACTION"
 )
 
-# Paths - Updated to match your training data structure
-BASE_MODEL_DIR = "/root/pycharm_semanticsearch/PATH_TO_OUTPUT_MODEL/webq"
-DATA_DIR = "/root/pycharm_semanticsearch/dataset"
+# Paths - Updated based on your data structure
+BASE_MODEL_DIR = "/root/pycharm_semanticsearch/PATH_TO_OUTPUT_MODEL/covid"
+DATA_DIR = "/root/pycharm_semanticsearch/dataset/covid"
 OUTPUTS_DIR = "/root/pycharm_semanticsearch"
 
-# Checkpoints to evaluate
-CHECKPOINTS = [f"checkpoint-epoch-9"]
-RESULTS_FILE = os.path.join(OUTPUTS_DIR, "zevaluation_results_webq_EL.csv")
-DETAILED_RESULTS_FILE = os.path.join(OUTPUTS_DIR, "zdetailed_evaluation_results_webq_EL.xlsx")
+# SINGLE CHECKPOINT TO EVALUATE
+CHECKPOINT = "checkpoint-epoch-5"
+RESULTS_FILE = os.path.join(OUTPUTS_DIR, "zevaluation_results_covid_EL.csv")
+DETAILED_RESULTS_FILE = os.path.join(OUTPUTS_DIR, "zdetailed_evaluation_results_covid_EL.xlsx")
 
-# Use the same data files as training
-QUERIES_FILE = os.path.join(DATA_DIR, "web_questions/test/queries.tsv")
-CORPUS_FILE = os.path.join(DATA_DIR, "web_questions/test/corpus.tsv")
-QRELS_FILE = os.path.join(DATA_DIR, "web_questions/test/qrels.tsv")
+# UPDATED PATHS BASED ON YOUR DATA STRUCTURE
+QUERIES_FILE = os.path.join(DATA_DIR, "test/queries.tsv")
+CORPUS_FILE = os.path.join(DATA_DIR, "test/corpus.tsv")
+QRELS_FILE = os.path.join(DATA_DIR, "test/qrels.tsv")
 
 # Settings
 MAX_QUERIES = 3000  # process all queries
@@ -57,9 +57,13 @@ MAX_CORPUS_DOCS = 10000000  # process all corpus documents
 RECALL_K = 10
 BATCH_SIZE = 16
 
+# UPDATED: Define relevance thresholds
+RELEVANCE_THRESHOLD = 1.0  # Consider both 1.0 and 2.0 as relevant
+HIGH_RELEVANCE_THRESHOLD = 2.0  # Only 2.0 as highly relevant
+
 # Entity Linking Cache Files
-ENRICHED_QUERIES_CACHE = "enriched_queries_webq.pkl"
-ENRICHED_RECORDS_CACHE = "enriched_records_webq.pkl"
+ENRICHED_QUERIES_CACHE = "enriched_queries_covid.pkl"
+ENRICHED_RECORDS_CACHE = "enriched_records_covid.pkl"
 
 args = Namespace(
     num_heads=8,
@@ -74,7 +78,7 @@ args = Namespace(
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = ""
+MODEL_PATH = os.path.join(BASE_MODEL_DIR, CHECKPOINT)
 
 
 def load_queries(max_queries=None):
@@ -83,6 +87,7 @@ def load_queries(max_queries=None):
     try:
         df = pd.read_csv(QUERIES_FILE, sep='\t')
         print(f"✅ Loaded queries DataFrame with {len(df)} rows")
+        print(f"✅ Columns in queries: {df.columns.tolist()}")
 
         for _, row in df.iterrows():
             if max_queries and len(queries) >= max_queries:
@@ -99,7 +104,7 @@ def load_queries(max_queries=None):
         # Print sample
         if queries:
             sample_id = list(queries.keys())[0]
-            print(f"   Sample: ID='{sample_id}', Query='{queries[sample_id]}'")
+            # print(f"   Sample: ID='{sample_id}', Query='{queries[sample_id]}'")
 
     except Exception as e:
         print(f"❌ Failed to load queries: {e}")
@@ -115,6 +120,7 @@ def load_corpus(max_docs=None):
     try:
         df = pd.read_csv(CORPUS_FILE, sep='\t')
         print(f"✅ Loaded corpus DataFrame with {len(df)} rows")
+        print(f"✅ Columns in corpus: {df.columns.tolist()}")
 
         for _, row in df.iterrows():
             if max_docs and len(corpus) >= max_docs:
@@ -131,7 +137,7 @@ def load_corpus(max_docs=None):
         # Print sample
         if corpus:
             sample_id = list(corpus.keys())[0]
-            print(f"   Sample: ID='{sample_id}', Text='{corpus[sample_id][:100]}...'")
+            # print(f"   Sample: ID='{sample_id}', Text='{corpus[sample_id][:100]}...'")
 
     except Exception as e:
         print(f"❌ Failed to load corpus: {e}")
@@ -142,22 +148,32 @@ def load_corpus(max_docs=None):
 
 
 def load_qrels():
-    """Load qrels from TSV with exact format from inspection"""
+    """Load qrels from TSV with exact format from inspection - UPDATED for relevance scores"""
     qrels = defaultdict(set)
+    high_relevance_qrels = defaultdict(set)  # For highly relevant documents (score 2.0)
+
     try:
         df = pd.read_csv(QRELS_FILE, sep='\t')
         print(f"✅ Loaded qrels DataFrame with {len(df)} rows")
+        print(f"✅ Columns in qrels: {df.columns.tolist()}")
+        print(f"✅ Unique relevance scores: {df['rel'].unique()}")
 
         for _, row in df.iterrows():
             query_id = str(row['query_id']).strip()
-            passage_id = str(row['passage_id']).strip()
-            rel = str(row['rel']).strip()
+            passage_id = str(row['corpus_id']).strip()
+            rel_score = float(row['rel'])  # UPDATED: Handle float relevance scores
 
-            if query_id and passage_id and rel == '1':
-                qrels[query_id].add(passage_id)
+            # UPDATED: Handle different relevance thresholds
+            if query_id and passage_id:
+                if rel_score >= RELEVANCE_THRESHOLD:  # Both 1.0 and 2.0 are relevant
+                    qrels[query_id].add(passage_id)
+                if rel_score >= HIGH_RELEVANCE_THRESHOLD:  # Only 2.0 is highly relevant
+                    high_relevance_qrels[query_id].add(passage_id)
 
-        print(f"✅ Loaded {len(qrels)} query-doc relationships")
+        print(f"✅ Loaded {len(qrels)} query-doc relationships (relevance >= {RELEVANCE_THRESHOLD})")
+        print(f"✅ Loaded {len(high_relevance_qrels)} query-doc relationships (high relevance >= {HIGH_RELEVANCE_THRESHOLD})")
         print(f"   Total relevant pairs: {sum(len(docs) for docs in qrels.values())}")
+        print(f"   Total highly relevant pairs: {sum(len(docs) for docs in high_relevance_qrels.values())}")
 
         # Print sample
         if qrels:
@@ -169,11 +185,11 @@ def load_qrels():
         import traceback
         traceback.print_exc()
 
-    return qrels
+    return qrels, high_relevance_qrels
 
 
-def verify_data_consistency(queries, corpus, qrels):
-    """Verify that data is loaded correctly with exact format"""
+def verify_data_consistency(queries, corpus, qrels, high_relevance_qrels=None):
+    """Verify that data is loaded correctly with exact format - UPDATED for relevance levels"""
     print("\n" + "=" * 50)
     print("DATA CONSISTENCY CHECK")
     print("=" * 50)
@@ -181,7 +197,10 @@ def verify_data_consistency(queries, corpus, qrels):
     # Basic counts
     print(f"Total queries: {len(queries)}")
     print(f"Total corpus documents: {len(corpus)}")
-    print(f"Total queries with relevance judgments: {len(qrels)}")
+    print(f"Total queries with relevance judgments (>= {RELEVANCE_THRESHOLD}): {len(qrels)}")
+
+    if high_relevance_qrels:
+        print(f"Total queries with high relevance judgments (>= {HIGH_RELEVANCE_THRESHOLD}): {len(high_relevance_qrels)}")
 
     # Check overlap between queries and qrels
     overlapping_queries = set(queries.keys()) & set(qrels.keys())
@@ -228,6 +247,7 @@ def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -252,7 +272,7 @@ def encode_corpus(model, corpus, batch_size=BATCH_SIZE, force_rebuild=False):
 
     # Compute unique cache file name based on model and corpus info
     cache_hash = compute_hash(MODEL_PATH, CORPUS_FILE, len(corpus), batch_size)
-    cache_file = f"corpus_embs_webq_{cache_hash}.pt"
+    cache_file = f"corpus_embs_covid_{cache_hash}.pt"
     meta_file = f"{cache_file}.meta.json"
 
     # Try loading existing cache
@@ -424,26 +444,23 @@ def quick_diagnostic():
     """Run a quick diagnostic to identify the issue"""
     print("🔍 RUNNING DIAGNOSTIC...")
 
-    # Test data loading
     queries = load_queries(10)  # Just load 10 for testing
-    corpus = load_corpus(100)  # Just load 100 for testing
-    qrels = load_qrels()
+    corpus = load_corpus(MAX_CORPUS_DOCS)  # Load full corpus like in main evaluation  <-- FIXED
+    qrels, high_relevance_qrels = load_qrels()  # UPDATED
 
     print(f"Queries loaded: {len(queries)}")
     print(f"Corpus loaded: {len(corpus)}")
     print(f"Qrels loaded: {len(qrels)}")
+    print(f"High relevance qrels loaded: {len(high_relevance_qrels)}")
 
     # Test data consistency
-    data_ok = verify_data_consistency(queries, corpus, qrels)
+    data_ok = verify_data_consistency(queries, corpus, qrels, high_relevance_qrels)
 
     # Test model loading
-    test_checkpoint = "checkpoint-epoch-14"  # Your best checkpoint
-    model_path = os.path.join(BASE_MODEL_DIR, test_checkpoint)
-
-    if os.path.exists(model_path):
-        print(f"✅ Checkpoint exists: {model_path}")
+    if os.path.exists(MODEL_PATH):
+        print(f"✅ Checkpoint exists: {MODEL_PATH}")
         # Test a simple embedding
-        model = load_model_with_weights(model_path, args, device)
+        model = load_model_with_weights(MODEL_PATH, args, device)
         test_embedding = verify_model_embeddings(model, ["test query"], device)
         print(f"✅ Model produces embeddings of shape: {test_embedding.shape}")
 
@@ -461,7 +478,7 @@ def quick_diagnostic():
             print(f"✅ Sample embeddings shape: {sample_embs.shape}")
             print(f"✅ Sample embeddings norm: {sample_embs.norm(dim=1)}")
     else:
-        print(f"❌ Checkpoint missing: {model_path}")
+        print(f"❌ Checkpoint missing: {MODEL_PATH}")
         return False
 
     return data_ok
@@ -872,20 +889,22 @@ def get_top_docs_sample(corpus, ranked_doc_ids, max_samples=3):
     return samples
 
 
-def evaluate_webq():
-    """Main evaluation function for WebQuestions with Entity Linking"""
-    global MODEL_PATH
-
+def evaluate_covid():
+    """Main evaluation function for COVID dataset with Entity Linking - UPDATED for relevance levels"""
     print("\n" + "=" * 60)
-    print("WEBQUESTIONS EVALUATION WITH ENTITY LINKING")
+    print("COVID DATASET EVALUATION WITH ENTITY LINKING")
     print("=" * 60)
 
     # Verify critical files exist
-    critical_files = [QUERIES_FILE, CORPUS_FILE, QRELS_FILE, MODEL_PATH]
+    critical_files = [QUERIES_FILE, CORPUS_FILE, QRELS_FILE]
     for f in critical_files:
         if not os.path.exists(f):
             print(f"❌ Critical file missing: {f}")
-            return 0.0, 0.0, []
+            return 0.0, 0.0, [], [], []
+
+    if not os.path.exists(MODEL_PATH):
+        print(f"❌ Model path missing: {MODEL_PATH}")
+        return 0.0, 0.0, [], [], []
 
     set_seed(42)
     print("[INFO] Random seed fixed to 42 for reproducibility.")
@@ -894,12 +913,12 @@ def evaluate_webq():
     print("\n[INFO] Loading evaluation data...")
     queries = load_queries(MAX_QUERIES)
     corpus = load_corpus(MAX_CORPUS_DOCS)
-    qrels = load_qrels()
+    qrels, high_relevance_qrels = load_qrels()  # UPDATED
 
     # Verify data consistency
-    if not verify_data_consistency(queries, corpus, qrels):
+    if not verify_data_consistency(queries, corpus, qrels, high_relevance_qrels):
         print("❌ CRITICAL: Data consistency check failed!")
-        return 0.0, 0.0, []
+        return 0.0, 0.0, [], [], []
 
     # Filter to queries that have relevance judgments AND exist in our queries
     valid_queries = {qid: qtext for qid, qtext in queries.items()
@@ -909,7 +928,7 @@ def evaluate_webq():
 
     if len(valid_queries) == 0:
         print("❌ No valid queries for evaluation!")
-        return 0.0, 0.0, []
+        return 0.0, 0.0, [], [], []
 
     # Load model
     print(f"\n[INFO] Loading model from: {MODEL_PATH}")
@@ -982,6 +1001,7 @@ def evaluate_webq():
             for j, qid in enumerate(batch_ids):
                 ranked_doc_ids = [corpus_ids[idx] for idx in I[j]]
                 relevant_doc_ids = list(qrels.get(qid, set()))
+                high_relevant_doc_ids = list(high_relevance_qrels.get(qid, set()))  # UPDATED
 
                 # Compute MRR
                 reciprocal_rank = 0
@@ -1035,6 +1055,7 @@ def evaluate_webq():
                     'reformulated_query': enrichment_record.get("reformulated_query", valid_queries[qid]),
                     'was_reformulated': enrichment_record.get("was_reformulated", "No"),
                     'relevant_doc_ids': relevant_doc_ids,
+                    'high_relevant_doc_ids': high_relevant_doc_ids,  # UPDATED
                     'top_10_doc_ids': ranked_doc_ids,
                     'MRR': reciprocal_rank,
                     'Recall@10': recall_at_k,
@@ -1060,6 +1081,8 @@ def evaluate_webq():
     print(f"Evaluated on {num_eval} queries")
     print(f"MRR@{RECALL_K}    : {avg_mrr:.4f}")
     print(f"Recall@{RECALL_K} : {avg_recall:.4f}")
+    print(f"Relevance threshold: >= {RELEVANCE_THRESHOLD}")
+    print(f"High relevance threshold: >= {HIGH_RELEVANCE_THRESHOLD}")
 
     # Calculate reformulation impact
     reformulated_results = [r for r in detailed_results if r['reformulation_impact'] == 'Yes']
@@ -1083,8 +1106,8 @@ def evaluate_webq():
     return avg_mrr, avg_recall, detailed_results, query_rows, entity_rows
 
 
-def save_detailed_results_to_excel(detailed_results, query_rows, entity_rows, checkpoint_name):
-    """Save detailed results to Excel file"""
+def save_detailed_results_to_excel(detailed_results, query_rows, entity_rows):
+    """Save detailed results to Excel file - UPDATED for relevance levels"""
     if not detailed_results:
         print("❌ No detailed results to save")
         return
@@ -1098,6 +1121,7 @@ def save_detailed_results_to_excel(detailed_results, query_rows, entity_rows, ch
             'reformulated_query': result['reformulated_query'],
             'was_reformulated': result['was_reformulated'],
             'relevant_doc_ids': str(result['relevant_doc_ids']),
+            'high_relevant_doc_ids': str(result.get('high_relevant_doc_ids', [])),  # UPDATED
             'top_10_doc_ids': str(result['top_10_doc_ids']),
             'MRR': result['MRR'],
             'Recall@10': result['Recall@10'],
@@ -1118,18 +1142,33 @@ def save_detailed_results_to_excel(detailed_results, query_rows, entity_rows, ch
 
     # Save to Excel
     try:
-        with pd.ExcelWriter(DETAILED_RESULTS_FILE, engine='openpyxl') as writer:
+        with pd.ExcelWriter(DETAILED_RESULTS_FILE, engine='openpyxl', mode='w') as writer:
             df.to_excel(writer, sheet_name=f'Evaluation_Results', index=False)
             queries_df.to_excel(writer, sheet_name='Enriched_Queries', index=False)
             entities_df.to_excel(writer, sheet_name='Entity_Details', index=False)
 
             # Add summary sheet
             summary_data = {
-                'Metric': ['Total Queries', 'Average MRR@10', 'Average Recall@10', 'Checkpoint',
-                           'Reformulated Queries', 'Original Queries'],
-                'Value': [len(df), df['MRR'].mean(), df['Recall@10'].mean(), checkpoint_name,
-                          len([r for r in detailed_results if r['reformulation_impact'] == 'Yes']),
-                          len([r for r in detailed_results if r['reformulation_impact'] == 'No'])]
+                'Metric': [
+                    'Total Queries',
+                    'Average MRR@10',
+                    'Average Recall@10',
+                    'Checkpoint',
+                    'Relevance Threshold',
+                    'High Relevance Threshold',
+                    'Reformulated Queries',
+                    'Original Queries'
+                ],
+                'Value': [
+                    len(df),
+                    df['MRR'].mean(),
+                    df['Recall@10'].mean(),
+                    CHECKPOINT,
+                    RELEVANCE_THRESHOLD,
+                    HIGH_RELEVANCE_THRESHOLD,
+                    len([r for r in detailed_results if r['reformulation_impact'] == 'Yes']),
+                    len([r for r in detailed_results if r['reformulation_impact'] == 'No'])
+                ]
             }
             summary_df = pd.DataFrame(summary_data)
             summary_df.to_excel(writer, sheet_name='Summary', index=False)
@@ -1138,7 +1177,7 @@ def save_detailed_results_to_excel(detailed_results, query_rows, entity_rows, ch
 
         # Print first few rows for verification
         print("\n📊 First 3 rows of detailed results:")
-        print(df.head(3).to_string(index=False))
+        # print(df.head(3).to_string(index=False))
 
     except Exception as e:
         print(f"❌ Failed to save Excel file: {e}")
@@ -1148,60 +1187,83 @@ def save_detailed_results_to_excel(detailed_results, query_rows, entity_rows, ch
         print(f"✅ Results saved to CSV as fallback: {csv_file}")
 
 
-def evaluate_all_checkpoints():
-    """Evaluate all checkpoints and save results to files"""
+def evaluate_single_checkpoint():
+    """Evaluate single checkpoint and save results to files"""
     # Create results file with header
     with open(RESULTS_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(
-            ['checkpoint', 'epoch', 'mrr@10', 'recall@10', 'num_queries', 'reformulated_queries', 'timestamp'])
+        writer.writerow([
+            'checkpoint',
+            'epoch',
+            'mrr@10',
+            'recall@10',
+            'num_queries',
+            'reformulated_queries',
+            'relevance_threshold',
+            'high_relevance_threshold',
+            'timestamp'
+        ])
 
-    print(f"Evaluating {len(CHECKPOINTS)} checkpoints...")
+    print(f"Evaluating checkpoint: {CHECKPOINT}")
     print(f"Results will be saved to: {RESULTS_FILE}")
     print(f"Detailed results will be saved to: {DETAILED_RESULTS_FILE}")
+    print(f"Relevance threshold: >= {RELEVANCE_THRESHOLD}")
+    print(f"High relevance threshold: >= {HIGH_RELEVANCE_THRESHOLD}")
 
-    for checkpoint in CHECKPOINTS:
-        global MODEL_PATH
-        MODEL_PATH = os.path.join(BASE_MODEL_DIR, checkpoint)
+    print(f"\n{'=' * 80}")
+    print(f"Evaluating checkpoint: {CHECKPOINT}")
+    print(f"{'=' * 80}")
 
-        if not os.path.exists(MODEL_PATH):
-            print(f"❌ Checkpoint not found: {MODEL_PATH}")
-            continue
+    try:
+        # Extract epoch number from checkpoint name
+        epoch_num = int(CHECKPOINT.split('-')[-1])
 
-        print(f"\n{'=' * 80}")
-        print(f"Evaluating checkpoint: {checkpoint}")
-        print(f"{'=' * 80}")
+        # Run evaluation
+        mrr, recall, detailed_results, query_rows, entity_rows = evaluate_covid()
 
-        try:
-            # Extract epoch number from checkpoint name
-            epoch_num = int(checkpoint.split('-')[-1])
+        # Count reformulated queries
+        reformulated_count = len([r for r in detailed_results if r.get('reformulation_impact') == 'Yes'])
 
-            # Run evaluation
-            mrr, recall, detailed_results, query_rows, entity_rows = evaluate_webq()
+        # Save summary results to CSV
+        with open(RESULTS_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                CHECKPOINT,
+                epoch_num,
+                mrr,
+                recall,
+                len(detailed_results),
+                reformulated_count,
+                RELEVANCE_THRESHOLD,
+                HIGH_RELEVANCE_THRESHOLD,
+                datetime.now()
+            ])
 
-            # Count reformulated queries
-            reformulated_count = len([r for r in detailed_results if r.get('reformulation_impact') == 'Yes'])
+        # Save detailed results to Excel
+        save_detailed_results_to_excel(detailed_results, query_rows, entity_rows)
 
-            # Save summary results to CSV
-            with open(RESULTS_FILE, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    [checkpoint, epoch_num, mrr, recall, len(detailed_results), reformulated_count, datetime.now()])
+        print(f"✅ Completed: {CHECKPOINT} - MRR@10: {mrr:.4f}, Recall@10: {recall:.4f}")
+        print(f"   Reformulated queries: {reformulated_count}/{len(detailed_results)}")
 
-            # Save detailed results to Excel
-            save_detailed_results_to_excel(detailed_results, query_rows, entity_rows, checkpoint)
-
-            print(f"✅ Completed: {checkpoint} - MRR@10: {mrr:.4f}, Recall@10: {recall:.4f}")
-            print(f"   Reformulated queries: {reformulated_count}/{len(detailed_results)}")
-
-        except Exception as e:
-            print(f"❌ Error evaluating {checkpoint}: {e}")
-            import traceback
-            traceback.print_exc()
-            # Save error result
-            with open(RESULTS_FILE, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([checkpoint, epoch_num, 0.0, 0.0, 0, 0, datetime.now(), f"Error: {str(e)}"])
+    except Exception as e:
+        print(f"❌ Error evaluating {CHECKPOINT}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Save error result
+        with open(RESULTS_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                CHECKPOINT,
+                epoch_num,
+                0.0,
+                0.0,
+                0,
+                0,
+                RELEVANCE_THRESHOLD,
+                HIGH_RELEVANCE_THRESHOLD,
+                datetime.now(),
+                f"Error: {str(e)}"
+            ])
 
     print(f"\n{'=' * 80}")
     print("Evaluation completed!")
@@ -1214,29 +1276,23 @@ def evaluate_all_checkpoints():
         print("\nSummary of results:")
         print(results_df[['checkpoint', 'epoch', 'mrr@10', 'recall@10', 'reformulated_queries']].to_string(index=False))
 
-        # Find best checkpoint
-        if len(results_df) > 0:
-            best_idx = results_df['mrr@10'].idxmax()
-            best_row = results_df.loc[best_idx]
-            print(f"\n🏆 BEST CHECKPOINT: {best_row['checkpoint']} with MRR@10: {best_row['mrr@10']:.4f}")
-
     except Exception as e:
         print(f"Could not read results file: {e}")
 
 
 if __name__ == "__main__":
     # Run diagnostic first to identify issues
-    print("🚀 Starting WebQuestions Evaluation with Entity Linking")
+    print("🚀 Starting COVID Dataset Evaluation with Entity Linking")
     diagnostic_ok = quick_diagnostic()
 
     if diagnostic_ok:
         print("\n" + "=" * 80)
-        print("DIAGNOSTIC PASSED - STARTING FULL EVALUATION")
+        print("DIAGNOSTIC PASSED - STARTING EVALUATION")
         print("=" * 80)
-        evaluate_all_checkpoints()
+        evaluate_single_checkpoint()
     else:
-        print("\n❌ DIAGNOSTIC FAILED - Please fix the issues above before running full evaluation")
+        print("\n❌ DIAGNOSTIC FAILED - Please fix the issues above before running evaluation")
         print("\n💡 TROUBLESHOOTING:")
         print("   1. Check if all data files exist at the specified paths")
-        print("   2. Verify the model checkpoints exist in: /root/pycharm_semanticsearch/PATH_TO_OUTPUT_MODEL/webq/")
+        print("   2. Verify the model checkpoint exists in: /root/pycharm_semanticsearch/PATH_TO_OUTPUT_MODEL/covid")
         print("   3. Make sure your data files match the expected format shown in the diagnostic")

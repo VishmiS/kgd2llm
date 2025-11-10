@@ -171,11 +171,7 @@ def query_wikidata_facts(qid):
         p = result.get('property', {}).get('value', '')
         v = result.get('value', {}).get('value', '')
 
-        # ✅ Only keep properties that start with dbo: or dbp:
-        if not (p.startswith("dbo:") or p.startswith("dbp:")):
-            continue
-
-        prop = p.split('/')[-1]
+        prop = p.split('/')[-1] if '/' in p else p
         val = v.strip()
 
         if prop and val:
@@ -183,6 +179,37 @@ def query_wikidata_facts(qid):
 
     return facts
 
+
+def is_technical_id(value):
+    """Check if a value is a technical ID/code that should be filtered out"""
+    if not value:
+        return True
+
+    value_str = str(value).strip().lower()
+
+    # Common technical ID patterns to reject
+    technical_patterns = [
+        r'^[nq][m]\d+',  # nm1234, qm1234 (IMDb, etc.)
+        r'^\d+$',  # Pure numbers
+        r'^[a-z]{1,3}\d+',  # Short codes with letters+numbers
+        r'^tt\d+',  # IMDb title IDs
+        r'^ch\d+',  # Character IDs
+    ]
+
+    for pattern in technical_patterns:
+        if re.match(pattern, value_str):
+            return True
+
+    # Reject common ID labels
+    id_indicators = ['imdb', 'isbn', 'issn', 'doi', 'id:', 'code:', 'number:']
+    if any(indicator in value_str for indicator in id_indicators):
+        return True
+
+    # Reject very short values with digits
+    if len(value_str) <= 4 and any(c.isdigit() for c in value_str):
+        return True
+
+    return False
 
 def fetch_entity_types(qid):
     """
@@ -505,6 +532,7 @@ def process_facts(entities, query_func, two_hop_func, label_func=None, question=
             if all(not p.lower().startswith(irr) for irr in irrelevant_props)
                and not v.lower().startswith('http')
                and len(v.strip()) > 1
+               and not is_technical_id(v)
         ]
 
         filtered = (
@@ -684,31 +712,60 @@ def get_entity_facts(qid, property_filter=None, limit=50):
 
     return facts
 
-def run_sparql_query(query, endpoint="https://query.wikidata.org/sparql"):
+
+def run_sparql_query(query, endpoint="https://query.wikidata.org/sparql", max_retries=3, base_delay=5):
     headers = {
         "Accept": "application/sparql-results+json",
         "User-Agent": "EntityLinkingPipeline/1.0 (https://example.org)"
     }
-    try:
-        response = requests.get(endpoint, params={"query": query}, headers=headers, timeout=30)
-        if response.status_code == 429:
-            print("[SPARQL] Rate limit hit (429) — retrying after delay...")
-            import time; time.sleep(5)
+
+    for attempt in range(max_retries):
+        try:
+            # Calculate delay with exponential backoff (except for first attempt)
+            if attempt > 0:
+                delay = base_delay * (2 ** (attempt - 1))  # 5, 10, 20 seconds
+                print(f"[SPARQL] Waiting {delay} seconds before retry {attempt + 1}/{max_retries}...")
+                time.sleep(delay)
+
             response = requests.get(endpoint, params={"query": query}, headers=headers, timeout=30)
 
-        response.raise_for_status()
-        data = response.json()
-        results = []
-        for b in data.get("results", {}).get("bindings", []):
-            row = {}
-            for k, v in b.items():
-                row[k] = v.get("value", "")
-            results.append(row)
-        return results
+            if response.status_code == 200:
+                data = response.json()
+                results = []
+                for b in data.get("results", {}).get("bindings", []):
+                    row = {}
+                    for k, v in b.items():
+                        row[k] = v.get("value", "")
+                    results.append(row)
+                return results
 
-    except Exception as e:
-        print(f"[SPARQL ERROR] {e}")
-        return []
+            elif response.status_code == 429:
+                print(f"[SPARQL] Rate limit hit (429) on attempt {attempt + 1}/{max_retries}")
+                if attempt == max_retries - 1:
+                    print("[SPARQL] Max retries reached for rate limiting")
+                    return []
+                continue  # Continue to next retry
+
+            else:
+                print(f"[SPARQL] HTTP error {response.status_code} on attempt {attempt + 1}")
+                response.raise_for_status()  # This will raise an exception for other HTTP errors
+
+        except requests.exceptions.Timeout:
+            print(f"[SPARQL] Timeout on attempt {attempt + 1}/{max_retries}")
+            if attempt == max_retries - 1:
+                return []
+
+        except requests.exceptions.RequestException as e:
+            print(f"[SPARQL] Request error on attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt == max_retries - 1:
+                return []
+
+        except Exception as e:
+            print(f"[SPARQL] Unexpected error on attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt == max_retries - 1:
+                return []
+
+    return []  # Return empty list if all retries fail
 
 
 # Add these to entity_linking_utils.py
@@ -854,3 +911,43 @@ def is_valid_answer(answer):
         return False
 
     return True
+
+
+def extract_main_entity_from_question(question_text):
+    """Extract the main entity from a question by removing question words and verbs"""
+    question_lower = question_text.lower().strip('?')
+
+    # Remove common question patterns
+    patterns_to_remove = [
+        r'^where did ',
+        r'^where was ',
+        r'^where is ',
+        r'^where are ',
+        r'^when did ',
+        r'^when was ',
+        r'^who did ',
+        r'^who was ',
+        r'^what did ',
+        r'^what was ',
+        r'^how did ',
+        r'^how was ',
+        r'\?$'
+    ]
+
+    cleaned = question_lower
+    for pattern in patterns_to_remove:
+        cleaned = re.sub(pattern, '', cleaned)
+
+    # Remove common verbs and question words
+    stop_words = ['go to', 'study at', 'work at', 'live in', 'born in', 'die in', 'marry']
+    for stop_word in stop_words:
+        cleaned = cleaned.replace(stop_word, '')
+
+    # Clean up extra spaces and return
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+    # If we have something reasonable, return it
+    if len(cleaned.split()) >= 1 and len(cleaned) > 2:
+        return cleaned.title()
+
+    return None
