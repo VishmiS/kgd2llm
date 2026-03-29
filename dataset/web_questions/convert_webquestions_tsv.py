@@ -36,12 +36,9 @@ def normalize_text(text: str) -> str:
     if not text or not isinstance(text, str):
         return ""
 
-    # --- Pre-clean multiline & tabbed text ---
-    # Replace newlines, tabs, carriage returns with a single space
+    # Pre-clean multiline & tabbed text
     text = re.sub(r'[\r\n\t]+', ' ', text)
-    # Replace bullet-like list markers (e.g. "* something") with just the word
     text = re.sub(r'^\s*[\*\-\u2022]+\s*', '', text)
-    # Collapse multiple spaces
     text = re.sub(r'\s{2,}', ' ', text).strip()
 
     # Lowercase
@@ -69,7 +66,6 @@ def normalize_text(text: str) -> str:
     return text
 
 
-
 def save_tsv(data, path, fieldnames):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -89,8 +85,7 @@ def save_tsv(data, path, fieldnames):
         for row in data:
             writer.writerow(sanitize_row(row))
 
-    print(f"✅ Saved: {path} ({len(data)} records)")
-
+    print(f"Saved: {path} ({len(data)} records)")
 
 
 # ============================================================
@@ -173,7 +168,7 @@ def fetch_dbpedia_note(dbpedia_uri, cache, entity_name):
 # Process JSONL and Create Dataset
 # ============================================================
 def process_jsonl(input_jsonl_path, output_dir, cache, split_offset=0):
-    print(f"\n📘 Processing: {input_jsonl_path}")
+    print(f"Processing: {input_jsonl_path}")
 
     queries, corpus, positives, qrels = [], [], [], []
 
@@ -205,12 +200,11 @@ def process_jsonl(input_jsonl_path, output_dir, cache, split_offset=0):
             if not answer or answer.isspace():
                 continue
 
-            # 🔥 ADD: Strip answer if longer than 300 tokens
+            # Strip answer if longer than 300 tokens
             if count_tokens(answer) > 300:
-                # Truncate to 300 tokens by taking first 300 words
                 tokens = answer.split()[:300]
                 answer = ' '.join(tokens)
-                print(f"⚠️  Truncated answer from {count_tokens(answer)} to 300 tokens")
+                print(f"Truncated answer from {count_tokens(answer)} to 300 tokens")
 
             dbpedia_uri = link_to_dbpedia(answer, cache)
             note = fetch_dbpedia_note(dbpedia_uri, cache, answer) if dbpedia_uri else None
@@ -221,20 +215,20 @@ def process_jsonl(input_jsonl_path, output_dir, cache, split_offset=0):
                 combined_text += f" , {note}"
             combined_text = normalize_text(combined_text)
 
-            # 🔥 CRITICAL FIX: Skip if combined_text becomes empty after normalization
+            # Skip if combined_text becomes empty after normalization
             if not combined_text or combined_text.isspace():
-                print(f"⚠️  Skipping empty combined_text for answer: '{answer[:50]}...'")
+                print(f"Skipping empty combined_text for answer: '{answer[:50]}...'")
                 continue
 
-            # 🔥 ADD: Check combined text length too
+            # Check combined text length too
             if count_tokens(combined_text) > 300:
                 tokens = combined_text.split()[:300]
                 combined_text = ' '.join(tokens)
-                print(f"⚠️  Truncated combined text to 300 tokens")
+                print(f"Truncated combined text to 300 tokens")
 
             # Final safety check after truncation
             if not combined_text or combined_text.isspace():
-                print(f"⚠️  Skipping empty text after truncation for answer: '{answer[:50]}...'")
+                print(f"Skipping empty text after truncation for answer: '{answer[:50]}...'")
                 continue
 
             if answer not in answer_to_pid:
@@ -272,6 +266,7 @@ def process_jsonl(input_jsonl_path, output_dir, cache, split_offset=0):
 
     return queries, corpus, positives, qrels
 
+
 def save_individual_splits(output_dir, split_name, queries, corpus, positives, qrels):
     """Save individual split data (train/val/test)"""
     # Remove duplicate qrels within the same split
@@ -288,9 +283,8 @@ def save_individual_splits(output_dir, split_name, queries, corpus, positives, q
 
     # Rename query IDs to match fieldnames
     queries_renamed = [{'query_id': q['id'], 'query': q['query']} for q in queries]
-    # Handle corpus with optional fields
-    # Handle corpus with optional fields
-    # 🔒 SAFE CORPUS CLEANING
+
+    # Safe corpus cleaning
     corpus_renamed = []
     none_text_count = 0
 
@@ -298,7 +292,7 @@ def save_individual_splits(output_dir, split_name, queries, corpus, positives, q
         text = c.get('text', '')
         if text is None or not isinstance(text, str) or text.strip() == '':
             none_text_count += 1
-            print(f"🚨 WARNING: Invalid or empty text in corpus entry - corpus_id: {c.get('id')}, skipping.")
+            print(f"WARNING: Invalid or empty text in corpus entry - corpus_id: {c.get('id')}, skipping.")
             continue
 
         # Pre-clean text for safe TSV export (remove tabs and newlines)
@@ -313,13 +307,14 @@ def save_individual_splits(output_dir, split_name, queries, corpus, positives, q
         corpus_renamed.append(corpus_entry)
 
     if none_text_count > 0:
-        print(f"🚨 FILTERED OUT {none_text_count} corpus entries with None text values!")
+        print(f"FILTERED OUT {none_text_count} corpus entries with None text values!")
 
     split_folder = os.path.join(output_dir, split_name)
     os.makedirs(split_folder, exist_ok=True)
 
     # Save split data
     save_tsv(queries_renamed, os.path.join(split_folder, 'queries.tsv'), ['query_id', 'query'])
+
     # Determine fieldnames based on available data
     corpus_fieldnames = ['corpus_id', 'text']
     positives_fieldnames = ['sentence1', 'sentence2', 'query_id', 'passage_id']
@@ -337,8 +332,6 @@ def save_individual_splits(output_dir, split_name, queries, corpus, positives, q
 
     save_tsv(corpus_renamed, os.path.join(split_folder, 'corpus.tsv'), corpus_fieldnames)
     save_tsv(positives, os.path.join(split_folder, 'positives.tsv'), positives_fieldnames)
-
-
     save_tsv(qrels, os.path.join(split_folder, 'qrels.tsv'), ['query_id', 'passage_id', 'rel'])
 
     # Create and save summary for this split - with deduplication
@@ -359,7 +352,7 @@ def save_individual_splits(output_dir, split_name, queries, corpus, positives, q
 
     summary_df.to_csv(os.path.join(split_folder, "summary.tsv"), sep="\t", index=False)
 
-    print(f"\n📊 {split_name.upper()} split stats:")
+    print(f"\n{split_name.upper()} split stats:")
     print(f" - Queries: {len(queries)}")
     print(f" - Corpus passages: {len(corpus)}")
     print(f" - Positives: {len(positives)}")
@@ -369,7 +362,7 @@ def save_individual_splits(output_dir, split_name, queries, corpus, positives, q
 
 def save_combined_full_dataset(output_dir, all_data):
     """Save combined dataset from all splits into full/ folder"""
-    print(f"\n🔄 Combining all splits into full dataset...")
+    print(f"Combining all splits into full dataset...")
 
     # Combine all data with proper deduplication
     combined_queries = []
@@ -407,9 +400,8 @@ def save_combined_full_dataset(output_dir, all_data):
 
     # Rename for final output
     queries_renamed = [{'query_id': q['id'], 'query': q['query']} for q in combined_queries]
-    # Handle corpus with optional fields
-    # Handle corpus with optional fields
-    # 🔒 SAFE CORPUS CLEANING
+
+    # Safe corpus cleaning for combined dataset
     corpus_renamed = []
     none_text_count = 0
 
@@ -417,7 +409,7 @@ def save_combined_full_dataset(output_dir, all_data):
         text = c.get('text', '')
         if text is None or not isinstance(text, str) or text.strip() == '':
             none_text_count += 1
-            print(f"🚨 WARNING: Invalid or empty text in combined corpus entry - corpus_id: {c.get('id')}, skipping.")
+            print(f"WARNING: Invalid or empty text in combined corpus entry - corpus_id: {c.get('id')}, skipping.")
             continue
 
         # Pre-clean text for safe TSV export (remove tabs and newlines)
@@ -432,11 +424,12 @@ def save_combined_full_dataset(output_dir, all_data):
         corpus_renamed.append(corpus_entry)
 
     if none_text_count > 0:
-        print(f"🚨 FILTERED OUT {none_text_count} combined corpus entries with None text values!")
+        print(f"FILTERED OUT {none_text_count} combined corpus entries with None text values!")
 
     # Save combined full dataset
     full_folder = os.path.join(output_dir, 'full')
     save_tsv(queries_renamed, os.path.join(full_folder, 'queries.tsv'), ['query_id', 'query'])
+
     # Determine fieldnames based on available data in combined dataset
     corpus_fieldnames = ['corpus_id', 'text']
     positives_fieldnames = ['sentence1', 'sentence2', 'query_id', 'passage_id']
@@ -467,6 +460,7 @@ def save_combined_full_dataset(output_dir, all_data):
     if any('note' in c for c in corpus_renamed):
         corpus_cols.append("note")
     corpus_df = pd.DataFrame(corpus_renamed)[corpus_cols]
+
     # Merge with inner joins to ensure only valid pairs
     summary_df = pd.merge(qrels_df, queries_df, on="query_id", how="inner")
     summary_df = pd.merge(summary_df, corpus_df, on="corpus_id", how="inner")
@@ -476,19 +470,20 @@ def save_combined_full_dataset(output_dir, all_data):
 
     summary_df.to_csv(os.path.join(full_folder, "summary.tsv"), sep="\t", index=False)
 
-    print(f"\n📊 COMBINED FULL DATASET stats:")
+    print(f"\nCOMBINED FULL DATASET stats:")
     print(f" - Total Unique Queries: {len(combined_queries)}")
     print(f" - Total Unique Corpus passages: {len(combined_corpus)}")
     print(f" - Total Positives: {len(combined_positives)}")
     print(f" - Total Unique Qrels: {len(combined_qrels)}")
     print(f" - Final Summary records: {len(summary_df)}")
 
+
 # ============================================================
 # Main
 # ============================================================
 
 def regenerate_all_webquestions():
-    print("🚀 REGENERATING ALL WebQuestions splits (with DBpedia linking + notes)")
+    print("REGENERATING ALL WebQuestions splits (with DBpedia linking + notes)")
 
     cache = load_cache()
 
@@ -520,9 +515,10 @@ def regenerate_all_webquestions():
     save_combined_full_dataset(output_dir, all_data)
 
     save_cache(cache)
-    print("\n🎉 All WebQuestions datasets regenerated successfully!")
+    print("\nAll WebQuestions datasets regenerated successfully!")
     print("   - Individual splits saved in train/, val/, test/ folders")
     print("   - Combined dataset saved in full/ folder")
+
 
 if __name__ == "__main__":
     regenerate_all_webquestions()

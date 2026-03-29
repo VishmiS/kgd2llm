@@ -43,7 +43,7 @@ def save_tsv(data, path, fieldnames):
         writer.writeheader()
         for row in data:
             writer.writerow(row)
-    print(f"✅ Saved: {path} ({len(data)} records)")
+    print(f"Saved: {path} ({len(data)} records)")
 
 
 # ============================================================
@@ -52,14 +52,14 @@ def save_tsv(data, path, fieldnames):
 
 def load_ms_marco_json(json_path):
     """Load the raw MS MARCO JSON file."""
-    print(f"\n📘 Loading dataset: {json_path}")
+    print(f"Loading dataset: {json_path}")
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
     passages_data = data.get('passages', {})
     queries_data = data.get('query', {})
 
-    print(f"📊 Dataset Overview:")
+    print(f"Dataset Overview:")
     print(f" - Passages: {len(passages_data)} queries with passages")
     print(f" - Queries:  {len(queries_data)}")
     return passages_data, queries_data
@@ -67,7 +67,7 @@ def load_ms_marco_json(json_path):
 
 def analyze_dataset(passages_data, queries_data):
     """Analyze the dataset to get unique queries, passages, and qrels."""
-    print(f"\n📊 Analyzing dataset statistics...")
+    print(f"Analyzing dataset statistics...")
 
     # Get all unique queries
     unique_queries = set()
@@ -96,7 +96,7 @@ def analyze_dataset(passages_data, queries_data):
                         'rel': 1
                     })
 
-    print(f"📈 Original Dataset Statistics:")
+    print(f"Original Dataset Statistics:")
     print(f" - Unique queries:   {len(unique_queries)}")
     print(f" - Unique passages:  {len(unique_passages)}")
     print(f" - Total qrels:      {len(all_qrels)}")
@@ -106,7 +106,7 @@ def analyze_dataset(passages_data, queries_data):
 
 def extract_30_percent_subset(passages_data, queries_data, all_qrels, fraction=0.3):
     """Extract 30% of queries and ALL their passages, then sample qrels from those."""
-    print(f"\n🎯 Extracting {fraction * 100:.0f}% subset of queries with ALL their passages...")
+    print(f"Extracting {fraction * 100:.0f}% subset of queries with ALL their passages...")
 
     # Get all unique query IDs that have qrels
     queries_with_qrels = set(qrel['query_id'] for qrel in all_qrels)
@@ -132,7 +132,7 @@ def extract_30_percent_subset(passages_data, queries_data, all_qrels, fraction=0
     # Now sample qrels only from our subset of queries
     subset_qrels = [qrel for qrel in all_qrels if qrel['query_id'] in subset_query_ids]
 
-    print(f"📊 30% Subset Statistics:")
+    print(f"30% Subset Statistics:")
     print(f" - Sampled queries:   {len(subset_query_ids)}")
     print(f" - All passages from sampled queries: {len(all_passages_from_sampled_queries)}")
     print(f" - Qrels from sampled queries: {len(subset_qrels)}")
@@ -162,7 +162,7 @@ def trim_corpus_passages(passages_data, max_tokens=300):
                 trimmed_count += 1
             trimmed_list.append({**p, "passage_text": ptext})
         trimmed_passages[qid] = trimmed_list
-    print(f"\n✂️ Trimmed {trimmed_count} passages exceeding {max_tokens} tokens.")
+    print(f"Trimmed {trimmed_count} passages exceeding {max_tokens} tokens.")
     return trimmed_passages
 
 
@@ -175,7 +175,7 @@ def build_datasets(passages_data, queries_data, subset_qrels, subset_corpus_ids)
     Includes ALL passages from the sampled queries, not just those in qrels.
     ROBUST VERSION: Handles normalization issues gracefully.
     """
-    print(f"\n🔨 Building datasets from 30% subset...")
+    print(f"Building datasets from 30% subset...")
 
     corpus, queries, qrels, positives = [], [], [], []
     seen_passages, seen_queries = set(), set()
@@ -238,7 +238,7 @@ def build_datasets(passages_data, queries_data, subset_qrels, subset_corpus_ids)
             passage_id_to_text[pid] = normalized_ptext
             stats['passages_processed'] += 1
 
-    print(f"\n📊 Processing Statistics:")
+    print(f"Processing Statistics:")
     print(f" - Queries processed: {stats['queries_processed']}")
     print(f" - Queries skipped: {stats['queries_skipped']}")
     print(f" - Passages processed: {stats['passages_processed']}")
@@ -271,7 +271,7 @@ def build_datasets(passages_data, queries_data, subset_qrels, subset_corpus_ids)
                 if pid not in passage_id_to_text:
                     print(f"Lost qrel - missing passage: {pid} for query: {qid}")
 
-    print(f"\n📈 Final 30% Subset Statistics:")
+    print(f"Final 30% Subset Statistics:")
     print(f" - Corpus:    {len(corpus)}")
     print(f" - Queries:   {len(queries)}")
     print(f" - Qrels:     {len(qrels)}")
@@ -281,14 +281,13 @@ def build_datasets(passages_data, queries_data, subset_qrels, subset_corpus_ids)
     original_qrels_count = len(subset_qrels)
     final_qrels_count = len(qrels)
     if final_qrels_count < original_qrels_count:
-        print(
-            f"⚠️  Lost {original_qrels_count - final_qrels_count} qrels ({(final_qrels_count / original_qrels_count) * 100:.1f}% retention)")
+        print(f"Warning: Lost {original_qrels_count - final_qrels_count} qrels ({(final_qrels_count / original_qrels_count) * 100:.1f}% retention)")
     else:
-        print(f"✅ Retained {final_qrels_count} qrels (100% retention)")
+        print(f"Retained {final_qrels_count} qrels (100% retention)")
 
     # CRITICAL: If we have no data, create minimal dummy data to avoid crashes
     if len(corpus) == 0 or len(queries) == 0:
-        print("🚨 WARNING: No data generated! Creating minimal dummy data...")
+        print("WARNING: No data generated! Creating minimal dummy data...")
         # Create minimal dummy entries to avoid crashes
         if len(corpus) == 0:
             corpus.append({'id': 'dummy_passage', 'text': 'sample passage text'})
@@ -310,7 +309,7 @@ def split_full30_fixed(full30_dir="./full30", split_dir_base=".", test_queries=5
     ALL splits share the SAME corpus from the original 30% subset.
     ROBUST VERSION: Handles edge cases gracefully.
     """
-    print(f"\n🎯 Splitting dataset with {val_queries} val and {test_queries} test queries...")
+    print(f"Splitting dataset with {val_queries} val and {test_queries} test queries...")
 
     # Load the full30 TSVs
     try:
@@ -319,7 +318,7 @@ def split_full30_fixed(full30_dir="./full30", split_dir_base=".", test_queries=5
         qrels = pd.read_csv(os.path.join(full30_dir, 'qrels.tsv'), sep='\t')
         positives = pd.read_csv(os.path.join(full30_dir, 'positives.tsv'), sep='\t')
     except Exception as e:
-        print(f"❌ Error loading files: {e}")
+        print(f"Error loading files: {e}")
         return
 
     # Use positives to regenerate qrels for consistency
@@ -352,7 +351,7 @@ def split_full30_fixed(full30_dir="./full30", split_dir_base=".", test_queries=5
 
     # Check if we have enough data for splitting
     if available_queries < 3:
-        print("❌ Not enough queries for splitting. Creating single 'all' split instead.")
+        print("Not enough queries for splitting. Creating single 'all' split instead.")
         splits = {'all': set(all_query_ids)}
     else:
         # Split the data
@@ -382,7 +381,7 @@ def split_full30_fixed(full30_dir="./full30", split_dir_base=".", test_queries=5
         }
 
     # Verify split sizes
-    print(f"\n📊 Split Verification:")
+    print(f"Split Verification:")
     for split_name, split_query_ids in splits.items():
         print(f" - {split_name.capitalize()} queries: {len(split_query_ids)}")
     print(f" - Shared corpus: {len(corpus)} passages")
@@ -390,10 +389,10 @@ def split_full30_fixed(full30_dir="./full30", split_dir_base=".", test_queries=5
     # Process each split
     for split_name, split_query_ids in splits.items():
         if len(split_query_ids) == 0:
-            print(f"\n⏭️  Skipping {split_name} split (no queries)")
+            print(f"Skipping {split_name} split (no queries)")
             continue
 
-        print(f"\n🚀 Processing {split_name} split...")
+        print(f"Processing {split_name} split...")
 
         # Filter queries that are in this split
         split_queries = queries[queries['id'].isin(split_query_ids)]
@@ -455,7 +454,7 @@ def split_full30_fixed(full30_dir="./full30", split_dir_base=".", test_queries=5
         summary.columns = ['query_id', 'sentence1', 'corpus_id', 'sentence2', 'rel']
         summary.to_csv(os.path.join(split_dir, 'summary.tsv'), sep='\t', index=False)
 
-        print(f"✅ Saved {split_name} split:")
+        print(f"Saved {split_name} split:")
         print(f"   - Queries: {len(split_queries)}")
         print(f"   - Corpus:  {len(split_corpus)}")
         print(f"   - Qrels:   {len(split_qrels)}")
